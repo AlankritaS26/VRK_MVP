@@ -1,187 +1,121 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import FileResponse
-from faster_whisper import WhisperModel
-import shutil
-import os
-import subprocess
-
-app = FastAPI(title="Digital Receptionist Engine")
-
-# ---------------------------------------------------------------------------
-# LOAD THE MODEL ONCE at startup (not on every request — that would be slow)
-# ---------------------------------------------------------------------------
-print("Loading Whisper model... please wait.")
-model = WhisperModel("base", device="cpu", compute_type="int8")
-print("Model loaded. Engine is ready.")
-
-# Path to your Piper model file — must be in the SAME folder as main.py
-PIPER_MODEL = "en_US-amy-low.onnx"
-
-# The fixed greeting the receptionist always speaks back
-RECEPTIONIST_GREETING = (
-    "Hello! I'm your digital receptionist. "
-    "I can tell you our office hours or take a message for the team. "
-    "How can I help?"
-)
+import os                   #allows us to read password from database from env file
+import json  # Added this to handle your JSON file
+from fastapi import FastAPI ,Query        #turns code into web server which can send and receive data
+from dotenv import load_dotenv      #allows us to read password from database
+import redis            #drivers that allow python talk to redis and postresql
+#import psycopg2
+from database import get_db_connection, init_db
+from memory import set_context, get_context
 
 
-# ---------------------------------------------------------------------------
-# HEALTH CHECK
-# ---------------------------------------------------------------------------
-@app.get("/")
+# 1. Load the "secret" URLs from your .env file
+load_dotenv()
+# 2. Initialize the database table (Permanent Memory)
+init_db()
+app = FastAPI() #creates actual instance of web application
+# --- NEW: Helper function to read your RNSIT data ---
+def load_college_data():
+    with open("data/college_info.json", "r") as f:
+        return json.load(f)
+
+# 2. Setup Connections(connects two storage system)
+try:
+    # Connect to Memurai (Live Memory)
+    r = redis.from_url(os.getenv("REDIS_URL"),decode_responses=True)
+    
+    # Connect to PostgreSQL (Permanent Memory)
+    conn = get_db_connection()
+    if conn and r:
+       print(" Both databases connected successfully!")
+except Exception as e:
+    print(f" Connection Error: {e}")
+
+@app.get("/") #tells server when someone visit home page address(/)run this function
 def home():
-    return {"status": "Digital Receptionist Engine is Online"}
+    return {
+        "status": "RNSIT Kiosk Backend is Live",
+         "database": "Connected"
+         } #sends back  json response
+@app.get("/test-memory/{name}")
+def test_memory(name: str):
+    # This registers the student's name in Redis for 60 seconds
+    set_context("guest", "name", name, expiry=60)
+    return {"message": f"I will remember you for 60 seconds, {name}!"}
 
+# --- The "Brain" of the Kiosk ---
+@app.get("/ask")
+def ask_kiosk(question: str = Query(..., description="The student's question")):
+    user_name = get_context("guest", "name")
+    greeting = f"Hello {user_name}! " if user_name else ""
 
-# ---------------------------------------------------------------------------
-# FEATURE 1: THE EARS — POST /transcribe
-# Upload a .wav or .mp3, get back the spoken words as text.
-# ---------------------------------------------------------------------------
-@app.post("/transcribe")
-async def transcribe_audio(file: UploadFile = File(...)):
-    temp_path = "temp_upload.wav"
+    data = load_college_data()
+    question_lower = question.lower()
+    
+    # List of "filler words" to ignore
+    stop_words = ["is", "the", "where", "can", "you", "tell", "me", "who", "what", "how", "of", "in", "at", "a", "an"]
+    
+    # Extract important keywords from the user's sentence
+    query_words = [w for w in question_lower.split() if w not in stop_words]
+    
+    answer = None
 
+    # 1. Improved Logic: Match based on Keyword Overlap
+    best_match_score = 0
+    
+    for faq in data.get("faqs", []):
+        faq_q_lower = faq["q"].lower()
+        # Count how many of our query keywords are in this specific FAQ question
+        score = sum(1 for word in query_words if word in faq_q_lower)
+        
+        if score > best_match_score:
+            best_match_score = score
+            answer = faq["a"]
+
+    # 2. If score is too low, check Blocks or Departments
+    if best_match_score < 1:
+        # Check Blocks
+        for block_key, desc in data.get("blocks", {}).items():
+            clean_block = block_key.replace("_", " ")
+            if any(word in clean_block for word in query_words):
+                answer = desc
+                break
+       # Check Departments
+        if not answer:
+            for dept_key, details in data.get("departments", {}).items():
+                dept_name_clean = dept_key.replace("_", " ")
+                
+                # Check if the user is mentioning this department (e.g., "CSE" or "Computer Science")
+                if dept_name_clean in question_lower or dept_key in question_lower:
+                    
+                    # Intent 1: Intake/Seats
+                    if any(word in question_lower for word in ["intake", "seats", "capacity", "how many"]):
+                        answer = f"The {dept_name_clean.upper()} department has an annual intake of {details.get('intake', '180')} students."
+                    
+                    # Intent 2: HOD
+                    elif any(word in question_lower for word in ["hod", "head", "boss", "chairman"]):
+                        answer = f"The HOD of {dept_name_clean.upper()} is {details.get('hod', 'not listed')}."
+                    
+                    # Intent 3: Location (Default)
+                    else:
+                        answer = f"The {dept_name_clean.upper()} department is located on the {details.get('floor', 'ground floor')}."
+                    break
+
+    # Final Fallback
+    if not answer:
+        answer = "I'm sorry, I don't have that information yet. Please visit the Admin Block."
+
+    # Log to PostgreSQL (Keep your existing logging code here)
     try:
-        # Save the uploaded file to disk
-        with open(temp_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-
-        # Run Whisper on it
-        segments, info = model.transcribe(temp_path, beam_size=5)
-        full_text = " ".join(seg.text for seg in segments).strip()
-
-        return {
-            "transcription": full_text,
-            "language": info.language,
-            "language_probability": round(info.language_probability, 2),
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Transcription failed: {e}")
-
-    finally:
-        # FEATURE 3: CLEANUP CREW — always delete temp file, even on error
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-
-
-# ---------------------------------------------------------------------------
-# FEATURE 2: THE MOUTH — POST /speak
-# Send a text string, get back a .wav audio file of it spoken.
-# ---------------------------------------------------------------------------
-@app.post("/speak")
-async def text_to_speech(text: str):
-    if not text.strip():
-        raise HTTPException(status_code=400, detail="Text cannot be empty.")
-
-    output_path = "receptionist_voice.wav"
-
-    try:
-        _run_piper(text, output_path)
-        return FileResponse(
-            output_path,
-            media_type="audio/wav",
-            filename="response.wav",
+        db_conn = get_db_connection()
+        cur = db_conn.cursor()
+        cur.execute(
+            "INSERT INTO interactions (input_text, response_text) VALUES (%s, %s)",
+            (str(question), str(answer))
         )
+        db_conn.commit()
+        cur.close()
+        db_conn.close()
     except Exception as e:
-        if os.path.exists(output_path):
-            os.remove(output_path)
-        raise HTTPException(status_code=500, detail=f"Speech synthesis failed: {e}")
+        print(f"⚠️ Database logging failed: {e}")
 
-
-# ---------------------------------------------------------------------------
-# FEATURE 4: THE BRIDGE — POST /chat
-# Full pipeline: audio in -> transcribe -> greeting -> audio out
-# This is what your frontend button will call.
-# ---------------------------------------------------------------------------
-@app.post("/chat")
-async def chat(session_id: str, file: UploadFile = File(...)):
-    temp_input  = "temp_input.wav"
-    temp_output = "temp_output.wav"
-
-    try:
-        # Step 1: Save uploaded audio
-        with open(temp_input, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-
-        # Step 2: Transcribe (printed to terminal for debugging)
-        segments, info = model.transcribe(temp_input, beam_size=5)
-        user_said = " ".join(seg.text for seg in segments).strip()
-        print(f"[Session {session_id}] User said: {user_said}")
-
-        # Step 3: Generate the receptionist's spoken greeting
-        _run_piper(RECEPTIONIST_GREETING, temp_output)
-
-        # Step 4: Return the audio file
-        return FileResponse(
-            temp_output,
-            media_type="audio/wav",
-            filename="receptionist.wav",
-            headers={"X-User-Said": user_said},
-        )
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Chat pipeline failed: {e}")
-
-    finally:
-        # Always clean up the input file
-        if os.path.exists(temp_input):
-            os.remove(temp_input)
-
-
-# ---------------------------------------------------------------------------
-# INTEGRATION: POST /new-user
-# Slice 1 (Host) calls this when a person walks up to the receptionist.
-# Receives the session_id and confirms the engine is ready to listen.
-# ---------------------------------------------------------------------------
-@app.post("/new-user")
-async def new_user(session_id: str):
-    print(f"[New User] Session started: {session_id}")
-    return {"message": f"Listening for session {session_id}"}
-
-
-# ---------------------------------------------------------------------------
-# INTEGRATION: POST /speak-answer
-# Slice 3 (Brain) calls this after looking up the answer in the database.
-# Receives the answer text, converts it to voice, returns the audio.
-# ---------------------------------------------------------------------------
-@app.post("/speak-answer")
-async def speak_answer(session_id: str, answer: str):
-    if not answer.strip():
-        raise HTTPException(status_code=400, detail="Answer cannot be empty.")
-
-    output_path = "answer_voice.wav"
-    print(f"[Session {session_id}] Speaking answer: {answer}")
-
-    try:
-        _run_piper(answer, output_path)
-        return FileResponse(
-            output_path,
-            media_type="audio/wav",
-            filename="answer.wav",
-        )
-    except Exception as e:
-        if os.path.exists(output_path):
-            os.remove(output_path)
-        raise HTTPException(status_code=500, detail=f"Speech synthesis failed: {e}")
-
-
-# ---------------------------------------------------------------------------
-# HELPER: runs Piper as a subprocess (Windows-safe)
-# ---------------------------------------------------------------------------
-def _run_piper(text: str, output_path: str):
-    command = [
-        "python", "-m", "piper",
-        "--model", PIPER_MODEL,
-        "--output_file", output_path,
-    ]
-
-    result = subprocess.run(
-        command,
-        input=text.encode("utf-8"),
-        capture_output=True,
-    )
-
-    if result.returncode != 0:
-        error_msg = result.stderr.decode("utf-8", errors="replace")
-        raise RuntimeError(f"Piper error (code {result.returncode}): {error_msg}")
+    return {"question": question, "answer": f"{greeting}{answer}"}
