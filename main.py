@@ -1,187 +1,267 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import FileResponse
-from faster_whisper import WhisperModel
-import shutil
-import os
-import subprocess
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import uuid, json, os, base64
+from datetime import datetime, timedelta
 
-app = FastAPI(title="Digital Receptionist Engine")
+app = FastAPI(title='Slice 2 - Proactive Digital Receptionist')
 
-# ---------------------------------------------------------------------------
-# LOAD THE MODEL ONCE at startup (not on every request — that would be slow)
-# ---------------------------------------------------------------------------
-print("Loading Whisper model... please wait.")
-model = WhisperModel("base", device="cpu", compute_type="int8")
-print("Model loaded. Engine is ready.")
-
-# Path to your Piper model file — must be in the SAME folder as main.py
-PIPER_MODEL = "en_US-amy-low.onnx"
-
-# The fixed greeting the receptionist always speaks back
-RECEPTIONIST_GREETING = (
-    "Hello! I'm your digital receptionist. "
-    "I can tell you our office hours or take a message for the team. "
-    "How can I help?"
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
+# ─────────────────────────────────────────────
+# FACE DATABASE  (stored as JSON on disk)
+# ─────────────────────────────────────────────
+FACE_DB_PATH = "face_db.json"
 
-# ---------------------------------------------------------------------------
-# HEALTH CHECK
-# ---------------------------------------------------------------------------
+def load_face_db() -> dict:
+    if os.path.exists(FACE_DB_PATH):
+        with open(FACE_DB_PATH, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_face_db(db: dict):
+    with open(FACE_DB_PATH, "w") as f:
+        json.dump(db, f, indent=2)
+
+def purge_old_entries(db: dict) -> dict:
+    """Remove faces not seen in 30 days."""
+    cutoff = datetime.now() - timedelta(days=30)
+    return {
+        k: v for k, v in db.items()
+        if datetime.fromisoformat(v["last_seen"]) > cutoff
+    }
+
+# ─────────────────────────────────────────────
+# WEBSOCKET MANAGER
+# ─────────────────────────────────────────────
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: list[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: dict):
+        dead = []
+        for conn in self.active_connections:
+            try:
+                await conn.send_json(message)
+            except Exception:
+                dead.append(conn)
+        for d in dead:
+            self.active_connections.remove(d)
+
+manager = ConnectionManager()
+
+# ─────────────────────────────────────────────
+# IN-MEMORY ACTIVE SESSION (session.py polls this)
+# ─────────────────────────────────────────────
+active_session: dict | None = None
+
+# ─────────────────────────────────────────────
+# CURRENT SESSION ENDPOINT (for session.py)
+# ─────────────────────────────────────────────
+@app.get("/session/current")
+async def get_current_session():
+    if active_session:
+        return {"active": True, **active_session}
+    return {"active": False}
+
+# ─────────────────────────────────────────────
+# WEBSOCKET ENDPOINT
+# ─────────────────────────────────────────────
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+
+# ─────────────────────────────────────────────
+# FACE REGISTRATION  (called from detection.py)
+# ─────────────────────────────────────────────
+class RegisterFacePayload(BaseModel):
+    face_id: str          # unique key from face_recognition (encoding hash)
+    name: str             # e.g. "Akshatha"
+    encoding: list[float] # 128-float face encoding
+
+@app.post("/face/register")
+async def register_face(payload: RegisterFacePayload):
+    db = load_face_db()
+    db = purge_old_entries(db)
+    db[payload.face_id] = {
+        "name": payload.name,
+        "encoding": payload.encoding,
+        "registered_at": datetime.now().isoformat(),
+        "last_seen": datetime.now().isoformat(),
+        "visit_count": db.get(payload.face_id, {}).get("visit_count", 0) + 1
+    }
+    save_face_db(db)
+    return {"status": "registered", "name": payload.name}
+
+# ─────────────────────────────────────────────
+# FACE LOOKUP  (called from detection.py on match)
+# ─────────────────────────────────────────────
+@app.get("/face/lookup/{face_id}")
+async def lookup_face(face_id: str):
+    db = load_face_db()
+    db = purge_old_entries(db)
+    if face_id in db:
+        db[face_id]["last_seen"] = datetime.now().isoformat()
+        db[face_id]["visit_count"] = db[face_id].get("visit_count", 0) + 1
+        save_face_db(db)
+        return {"found": True, **db[face_id]}
+    return {"found": False}
+
+# ─────────────────────────────────────────────
+# GET ALL KNOWN FACES  (so detection.py can load encodings on startup)
+# ─────────────────────────────────────────────
+@app.get("/face/all")
+async def get_all_faces():
+    db = load_face_db()
+    db = purge_old_entries(db)
+    save_face_db(db)
+    return db
+
+# ─────────────────────────────────────────────
+# SESSION START  (camera triggers this)
+# ─────────────────────────────────────────────
+@app.post("/session/start")
+async def start_session(
+    trigger: str = "camera",
+    user_name: str = "Guest",
+    is_returning: bool = False,
+    visit_count: int = 1
+):
+    global active_session, message_log
+    session_id = str(uuid.uuid4())
+    active_session = {
+        "session_id":  session_id,
+        "user_name":   user_name,
+        "is_returning": is_returning,
+        "visit_count": visit_count
+    }
+    message_log = []   # clear log for new session
+    await manager.broadcast({
+        "type": "session_start",
+        "session": active_session
+    })
+    print(f"[SESSION] STARTED {session_id} user={user_name} returning={is_returning} visit={visit_count}")
+    return {"status": "success", "session_id": session_id, "session": active_session}
+
+# ─────────────────────────────────────────────
+# SESSION END  (camera triggers when visitor leaves)
+# ─────────────────────────────────────────────
+@app.post("/session/end")
+async def end_session(session_id: str = None):
+    global active_session
+    active_session = None
+    await manager.broadcast({"type": "session_end", "session_id": session_id})
+    return {"status": "success"}
+
+# ─────────────────────────────────────────────
+# MESSAGE STORE (in-memory log per session)
+# ─────────────────────────────────────────────
+message_log: list[dict] = []   # cleared on each new session
+
+# ─────────────────────────────────────────────
+# MESSAGE  (Slice 1 posts here, we broadcast to React + store)
+# ─────────────────────────────────────────────
+class MessagePayload(BaseModel):
+    session_id: str
+    text: str
+    speaker: str = "user"   # "user" or "kiosk"
+
+@app.post("/message")
+async def send_message(payload: MessagePayload):
+    entry = {
+        "session_id": payload.session_id,
+        "text":       payload.text,
+        "speaker":    payload.speaker
+    }
+    message_log.append(entry)
+    await manager.broadcast({
+        "type":    "message",
+        "text":    payload.text,
+        "speaker": payload.speaker
+    })
+    return {"status": "success"}
+
+# ─────────────────────────────────────────────
+# GET MESSAGES  (session.py polls this to save transcript)
+# ─────────────────────────────────────────────
+@app.get("/session/messages/{session_id}")
+async def get_messages(session_id: str, after: int = 0):
+    relevant = [m for m in message_log if m["session_id"] == session_id]
+    return {"messages": relevant[after:]}
+
+# ─────────────────────────────────────────────
+# ROOT HEALTH CHECK
+# ─────────────────────────────────────────────
 @app.get("/")
-def home():
-    return {"status": "Digital Receptionist Engine is Online"}
+async def root():
+    return {"status": "RNS Digital Receptionist Backend Running ✅"}
 
+# ─────────────────────────────────────────────
+# VISITOR NAME COLLECTION
+# ─────────────────────────────────────────────
+visitor_name_response: dict = {"ready": False, "name": "", "save": True}
 
-# ---------------------------------------------------------------------------
-# FEATURE 1: THE EARS — POST /transcribe
-# Upload a .wav or .mp3, get back the spoken words as text.
-# ---------------------------------------------------------------------------
-@app.post("/transcribe")
-async def transcribe_audio(file: UploadFile = File(...)):
-    temp_path = "temp_upload.wav"
+@app.post("/visitor/unknown")
+async def visitor_unknown():
+    global visitor_name_response
+    visitor_name_response = {"ready": False, "name": "", "save": True}
+    await manager.broadcast({"type": "ask_name"})
+    return {"status": "asking"}
 
-    try:
-        # Save the uploaded file to disk
-        with open(temp_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+@app.post("/visitor/submit_name")
+async def submit_name(name: str = "", save: bool = True):
+    global visitor_name_response
+    visitor_name_response = {"ready": True, "name": name, "save": save}
+    await manager.broadcast({"type": "name_received", "name": name, "save": save})
+    return {"status": "received"}
 
-        # Run Whisper on it
-        segments, info = model.transcribe(temp_path, beam_size=5)
-        full_text = " ".join(seg.text for seg in segments).strip()
+@app.get("/visitor/name_response")
+async def get_name_response():
+    return visitor_name_response
 
-        return {
-            "transcription": full_text,
-            "language": info.language,
-            "language_probability": round(info.language_probability, 2),
-        }
+@app.post("/visitor/clear_response")
+async def clear_response():
+    global visitor_name_response
+    visitor_name_response = {"ready": False, "name": "", "save": True}
+    return {"status": "cleared"}
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Transcription failed: {e}")
-
-    finally:
-        # FEATURE 3: CLEANUP CREW — always delete temp file, even on error
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-
-
-# ---------------------------------------------------------------------------
-# FEATURE 2: THE MOUTH — POST /speak
-# Send a text string, get back a .wav audio file of it spoken.
-# ---------------------------------------------------------------------------
-@app.post("/speak")
-async def text_to_speech(text: str):
-    if not text.strip():
-        raise HTTPException(status_code=400, detail="Text cannot be empty.")
-
-    output_path = "receptionist_voice.wav"
-
-    try:
-        _run_piper(text, output_path)
-        return FileResponse(
-            output_path,
-            media_type="audio/wav",
-            filename="response.wav",
-        )
-    except Exception as e:
-        if os.path.exists(output_path):
-            os.remove(output_path)
-        raise HTTPException(status_code=500, detail=f"Speech synthesis failed: {e}")
-
-
-# ---------------------------------------------------------------------------
-# FEATURE 4: THE BRIDGE — POST /chat
-# Full pipeline: audio in -> transcribe -> greeting -> audio out
-# This is what your frontend button will call.
-# ---------------------------------------------------------------------------
-@app.post("/chat")
-async def chat(session_id: str, file: UploadFile = File(...)):
-    temp_input  = "temp_input.wav"
-    temp_output = "temp_output.wav"
-
-    try:
-        # Step 1: Save uploaded audio
-        with open(temp_input, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-
-        # Step 2: Transcribe (printed to terminal for debugging)
-        segments, info = model.transcribe(temp_input, beam_size=5)
-        user_said = " ".join(seg.text for seg in segments).strip()
-        print(f"[Session {session_id}] User said: {user_said}")
-
-        # Step 3: Generate the receptionist's spoken greeting
-        _run_piper(RECEPTIONIST_GREETING, temp_output)
-
-        # Step 4: Return the audio file
-        return FileResponse(
-            temp_output,
-            media_type="audio/wav",
-            filename="receptionist.wav",
-            headers={"X-User-Said": user_said},
-        )
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Chat pipeline failed: {e}")
-
-    finally:
-        # Always clean up the input file
-        if os.path.exists(temp_input):
-            os.remove(temp_input)
-
-
-# ---------------------------------------------------------------------------
-# INTEGRATION: POST /new-user
-# Slice 1 (Host) calls this when a person walks up to the receptionist.
-# Receives the session_id and confirms the engine is ready to listen.
-# ---------------------------------------------------------------------------
-@app.post("/new-user")
-async def new_user(session_id: str):
-    print(f"[New User] Session started: {session_id}")
-    return {"message": f"Listening for session {session_id}"}
-
-
-# ---------------------------------------------------------------------------
-# INTEGRATION: POST /speak-answer
-# Slice 3 (Brain) calls this after looking up the answer in the database.
-# Receives the answer text, converts it to voice, returns the audio.
-# ---------------------------------------------------------------------------
-@app.post("/speak-answer")
-async def speak_answer(session_id: str, answer: str):
-    if not answer.strip():
-        raise HTTPException(status_code=400, detail="Answer cannot be empty.")
-
-    output_path = "answer_voice.wav"
-    print(f"[Session {session_id}] Speaking answer: {answer}")
-
-    try:
-        _run_piper(answer, output_path)
-        return FileResponse(
-            output_path,
-            media_type="audio/wav",
-            filename="answer.wav",
-        )
-    except Exception as e:
-        if os.path.exists(output_path):
-            os.remove(output_path)
-        raise HTTPException(status_code=500, detail=f"Speech synthesis failed: {e}")
-
-
-# ---------------------------------------------------------------------------
-# HELPER: runs Piper as a subprocess (Windows-safe)
-# ---------------------------------------------------------------------------
-def _run_piper(text: str, output_path: str):
-    command = [
-        "python", "-m", "piper",
-        "--model", PIPER_MODEL,
-        "--output_file", output_path,
-    ]
-
-    result = subprocess.run(
-        command,
-        input=text.encode("utf-8"),
-        capture_output=True,
-    )
-
-    if result.returncode != 0:
-        error_msg = result.stderr.decode("utf-8", errors="replace")
-        raise RuntimeError(f"Piper error (code {result.returncode}): {error_msg}")
+@app.post("/visitor/delete_my_data")
+async def delete_my_data(name: str = ""):
+    import shutil, json as _json
+    from pathlib import Path as _Path
+    lp = _Path("face_labels.json"); fd = _Path("faces"); mp = _Path("face_model.yml")
+    deleted = False
+    if lp.exists():
+        lmap = _json.loads(lp.read_text())
+        new_lmap = {}
+        for k, v in lmap.items():
+            if v.get("name","").lower() == name.lower():
+                face_dir = fd / v.get("face_id","")
+                if face_dir.exists(): shutil.rmtree(face_dir)
+                deleted = True
+                print(f"[PRIVACY] Deleted data for {name}")
+            else:
+                new_lmap[k] = v
+        lp.write_text(_json.dumps(new_lmap, indent=2))
+        if mp.exists(): mp.unlink()
+    await manager.broadcast({"type": "data_deleted", "name": name})
+    return {"deleted": deleted, "name": name}
