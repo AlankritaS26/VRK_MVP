@@ -1,0 +1,38 @@
+{
+  "session_id": "388f33bc-d739-4b13-9d8e-0dce6b58d647",
+  "user_name": "akshu",
+  "started_at": "2026-05-09T19:50:04.238303",
+  "ended_at": "2026-05-09T19:52:24.040427",
+  "transcript": [
+    {
+      "speaker": "user",
+      "text": "Heyness.",
+      "timestamp": "2026-05-09T19:51:03.757920"
+    },
+    {
+      "speaker": "kiosk",
+      "text": "Hello! Welcome to RNSIT. I am sorry, I do not have that information. Please visit the Admin Block.",
+      "timestamp": "2026-05-09T19:51:04.823883"
+    },
+    {
+      "speaker": "user",
+      "text": "Where do I find the library?",
+      "timestamp": "2026-05-09T19:51:26.431699"
+    },
+    {
+      "speaker": "kiosk",
+      "text": "RNSIT Central Library. Location: Opposite the Administrative Block. Timings: 09:00 AM to 08:00 PM",
+      "timestamp": "2026-05-09T19:51:26.461774"
+    },
+    {
+      "speaker": "user",
+      "text": "Where do I find canteen?",
+      "timestamp": "2026-05-09T19:51:50.194652"
+    },
+    {
+      "speaker": "kiosk",
+      "text": "Location: Near the sports ground and hostel entrance",
+      "timestamp": "2026-05-09T19:51:51.245271"
+    }
+  ]
+}

@@ -1,0 +1,78 @@
+{
+  "session_id": "efb87b4c-5535-4e56-8314-4a1acbbe2d9e",
+  "user_name": "akshu",
+  "started_at": "2026-05-09T19:45:34.906412",
+  "ended_at": "2026-05-09T19:50:00.163058",
+  "transcript": [
+    {
+      "speaker": "user",
+      "text": "Hello. Hello.",
+      "timestamp": "2026-05-09T19:46:07.803914"
+    },
+    {
+      "speaker": "kiosk",
+      "text": "Hello! Welcome to RNSIT. I am sorry, I do not have that information. Please visit the Admin Block.",
+      "timestamp": "2026-05-09T19:46:08.858925"
+    },
+    {
+      "speaker": "user",
+      "text": "Here.",
+      "timestamp": "2026-05-09T19:47:35.119367"
+    },
+    {
+      "speaker": "kiosk",
+      "text": "I am sorry, I do not have that information. Please visit the Admin Block.",
+      "timestamp": "2026-05-09T19:47:35.146420"
+    },
+    {
+      "speaker": "user",
+      "text": "Where do I find library?",
+      "timestamp": "2026-05-09T19:47:54.724817"
+    },
+    {
+      "speaker": "kiosk",
+      "text": "RNSIT Central Library. Location: Opposite the Administrative Block. Timings: 09:00 AM to 08:00 PM",
+      "timestamp": "2026-05-09T19:47:54.756848"
+    },
+    {
+      "speaker": "user",
+      "text": "Where is the candy?",
+      "timestamp": "2026-05-09T19:48:12.234985"
+    },
+    {
+      "speaker": "kiosk",
+      "text": "I am sorry, I do not have that information. Please visit the Admin Block.",
+      "timestamp": "2026-05-09T19:48:12.272429"
+    },
+    {
+      "speaker": "user",
+      "text": "Where is the canteen.",
+      "timestamp": "2026-05-09T19:48:23.591871"
+    },
+    {
+      "speaker": "kiosk",
+      "text": "Location: Near the sports ground and hostel entrance",
+      "timestamp": "2026-05-09T19:48:23.624883"
+    },
+    {
+      "speaker": "user",
+      "text": "Hey RNS.",
+      "timestamp": "2026-05-09T19:49:33.427452"
+    },
+    {
+      "speaker": "kiosk",
+      "text": "Hello! Welcome to RNSIT. I am sorry, I do not have that information. Please visit the Admin Block.",
+      "timestamp": "2026-05-09T19:49:33.455544"
+    },
+    {
+      "speaker": "user",
+      "text": "Hardness.",
+      "timestamp": "2026-05-09T19:49:58.068105"
+    },
+    {
+      "speaker": "kiosk",
+      "text": "I am sorry, I do not have that information. Please visit the Admin Block.",
+      "timestamp": "2026-05-09T19:49:59.125337"
+    }
+  ]
+}

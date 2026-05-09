@@ -1,0 +1,38 @@
+{
+  "session_id": "f4ba3b1b-0542-46a5-a335-84b4f14fe516",
+  "user_name": "akshu",
+  "started_at": "2026-05-09T19:29:07.308622",
+  "ended_at": "2026-05-09T19:33:08.248905",
+  "transcript": [
+    {
+      "speaker": "user",
+      "text": "Hey, hello.",
+      "timestamp": "2026-05-09T19:31:29.384692"
+    },
+    {
+      "speaker": "kiosk",
+      "text": "I'm sorry, I don't have that information yet. Please visit the Admin Block.",
+      "timestamp": "2026-05-09T19:31:31.470251"
+    },
+    {
+      "speaker": "user",
+      "text": "Where do I find library?",
+      "timestamp": "2026-05-09T19:31:43.782928"
+    },
+    {
+      "speaker": "kiosk",
+      "text": "Yes, campus-wide Wi-Fi is available for students and staff.",
+      "timestamp": "2026-05-09T19:31:44.851220"
+    },
+    {
+      "speaker": "user",
+      "text": "Who is the founder of RNSIT?",
+      "timestamp": "2026-05-09T19:32:02.316133"
+    },
+    {
+      "speaker": "kiosk",
+      "text": "Dr. Ramesh Babu H S is the current Principal.",
+      "timestamp": "2026-05-09T19:32:02.345641"
+    }
+  ]
+}

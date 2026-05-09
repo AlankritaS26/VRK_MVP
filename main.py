@@ -122,62 +122,101 @@ def test_memory(name: str):
     return {"message": f"I will remember you for 60 seconds, {name}!"}
 
 @app.get("/ask")
-def ask_kiosk(question: str = Query(..., description="The student's question")):
-    user_name = get_context("guest", "name")
-    greeting = f"Hello {user_name}! " if user_name else ""
+def ask_kiosk(question: str = Query(..., description="question")):
+    with open("data/college_info.json", encoding="utf-8") as f:
+        data = json.load(f)
 
-    data = load_college_data()
-    question_lower = question.lower()
-    
-    stop_words = ["is", "the", "where", "can", "you", "tell", "me", "who", "what", "how", "of", "in", "at", "a", "an"]
-    query_words = [w for w in question_lower.split() if w not in stop_words]
-    
+    q = question.lower().strip()
+    stop_words = {"is","the","where","can","you","tell","me","who","what","how","of","in","at","a","an","are","was","i","do","does","please","to","find","get","go","about","any","have","which","when"}
+    words = [w for w in q.split() if w not in stop_words and len(w) > 2]
+
     answer = None
-    best_match_score = 0
-    
-    for faq in data.get("faqs", []):
-        faq_q_lower = faq["q"].lower()
-        score = sum(1 for word in query_words if word in faq_q_lower)
-        if score > best_match_score:
-            best_match_score = score
-            answer = faq["a"]
+    best = 0
 
-    if best_match_score < 1:
-        for block_key, desc in data.get("blocks", {}).items():
-            clean_block = block_key.replace("_", " ")
-            if any(word in clean_block for word in query_words):
-                answer = desc
-                break
-        
-        if not answer:
-            for dept_key, details in data.get("departments", {}).items():
-                dept_name_clean = dept_key.replace("_", " ")
-                if dept_name_clean in question_lower or dept_key in question_lower:
-                    if any(word in question_lower for word in ["intake", "seats", "capacity", "how many"]):
-                        answer = f"The {dept_name_clean.upper()} department has an annual intake of {details.get('intake', '180')} students."
-                    elif any(word in question_lower for word in ["hod", "head", "boss", "chairman"]):
-                        answer = f"The HOD of {dept_name_clean.upper()} is {details.get('hod', 'not listed')}."
+    # FAQs - score by question match only
+    for faq in data.get("faqs", []):
+        fq = faq["question"].lower()
+        score = sum(2 for w in words if w in fq)
+        if score > best:
+            best = score
+            answer = faq["answer"]
+
+    # Facilities - direct keyword match beats FAQ if score low
+    for fname, fval in data.get("facilities", {}).items():
+        if fname in q or any(w in fname for w in words):
+            if isinstance(fval, dict):
+                parts = []
+                if fval.get("name"):     parts.append(fval["name"])
+                if fval.get("location"): parts.append("Location: " + fval["location"])
+                if fval.get("timings"):  parts.append("Timings: " + fval["timings"])
+                if fval.get("details"):  parts.append(fval["details"])
+                if fval.get("usage"):    parts.append(fval["usage"])
+                candidate = ". ".join(parts)
+            else:
+                candidate = str(fval)
+            if best < 3:
+                answer = candidate
+                best = 3
+            break
+
+    # Departments
+    if best < 2:
+        for dept, details in data.get("departments", {}).items():
+            dc = dept.replace("_"," ").lower()
+            if any(w in dc for w in words) or dc in q:
+                if isinstance(details, dict):
+                    if any(w in q for w in ["hod","head","who"]):
+                        answer = "HOD of " + dept.upper() + " is " + str(details.get("hod","not listed")) + "."
+                    elif any(w in q for w in ["intake","seats","students"]):
+                        answer = dept.upper() + " has intake of " + str(details.get("intake","180")) + " students."
+                    elif any(w in q for w in ["floor","location","where","block"]):
+                        answer = dept.upper() + " is on " + str(details.get("floor","ground floor")) + "."
                     else:
-                        answer = f"The {dept_name_clean.upper()} department is located on the {details.get('floor', 'ground floor')}."
-                    break
+                        answer = dept.upper() + " - Floor: " + str(details.get("floor","")) + ", HOD: " + str(details.get("hod","")) + "."
+                best = 2
+                break
+
+    # College info
+    if best < 2:
+        college = data.get("college", {})
+        for key, val in college.items():
+            if any(w in key.lower() for w in words):
+                answer = str(val)
+                best = 2
+                break
+
+    # Administration
+    if best < 2:
+        for key, val in data.get("administration", {}).items():
+            kc = key.replace("_"," ").lower()
+            if any(w in kc for w in words):
+                if isinstance(val, dict):
+                    name = val.get("name", "")
+                    qual = val.get("qualification", "")
+                    answer = kc.title() + ": " + name + (", " + qual if qual else "")
+                else:
+                    answer = str(val)
+                best = 2
+                break
 
     if not answer:
-        answer = "I'm sorry, I don't have that information yet. Please visit the Admin Block."
+        answer = "I am sorry, I do not have that information. Please visit the Admin Block."
+
+    greeting = ""
+    if any(w in q for w in ["hello","hi","hey"]):
+        greeting = "Hello! Welcome to RNSIT. "
 
     try:
         db_conn = get_db_connection()
         cur = db_conn.cursor()
-        cur.execute(
-            "INSERT INTO interactions (input_text, response_text) VALUES (%s, %s)",
-            (str(question), str(answer))
-        )
+        cur.execute("INSERT INTO interactions (input_text, response_text) VALUES (%s, %s)", (str(question), str(answer)))
         db_conn.commit()
         cur.close()
         db_conn.close()
     except Exception as e:
-        print(f"⚠️ Database logging failed: {e}")
+        print(f"DB log failed: {e}")
 
-    return {"question": question, "answer": f"{greeting}{answer}"}
+    return {"question": question, "answer": greeting + answer}
 
 # --- Slice 1/2 Session & Face Endpoints ---
 @app.get("/session/current")
@@ -286,3 +325,5 @@ async def clear_response():
     global visitor_name_response
     visitor_name_response = {"ready": False, "name": "", "save": True}
     return {"status": "cleared"}
+
+

@@ -1,0 +1,48 @@
+{
+  "session_id": "6b79e343-6ef3-4256-b55f-f4c910d5b89d",
+  "user_name": "akshu",
+  "started_at": "2026-05-09T02:48:45.278632",
+  "ended_at": "2026-05-09T02:49:35.168887",
+  "transcript": [
+    {
+      "speaker": "user",
+      "text": "Hello.",
+      "timestamp": "2026-05-09T02:48:51.521393"
+    },
+    {
+      "speaker": "kiosk",
+      "text": "I'm sorry, I don't have that information yet. Please visit the Admin Block.",
+      "timestamp": "2026-05-09T02:48:51.551162"
+    },
+    {
+      "speaker": "user",
+      "text": "Really.",
+      "timestamp": "2026-05-09T02:49:09.147971"
+    },
+    {
+      "speaker": "kiosk",
+      "text": "I'm sorry, I don't have that information yet. Please visit the Admin Block.",
+      "timestamp": "2026-05-09T02:49:09.172602"
+    },
+    {
+      "speaker": "user",
+      "text": "And block.",
+      "timestamp": "2026-05-09T02:49:15.440442"
+    },
+    {
+      "speaker": "kiosk",
+      "text": "I'm sorry, I don't have that information yet. Please visit the Admin Block.",
+      "timestamp": "2026-05-09T02:49:16.543538"
+    },
+    {
+      "speaker": "user",
+      "text": "Boys.",
+      "timestamp": "2026-05-09T02:49:24.842360"
+    },
+    {
+      "speaker": "kiosk",
+      "text": "I'm sorry, I don't have that information yet. Please visit the Admin Block.",
+      "timestamp": "2026-05-09T02:49:24.873911"
+    }
+  ]
+}
