@@ -111,6 +111,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     };
 
     try { recog.start(); } catch(e) { console.error(e); }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const sendToBackend = useCallback(async (text) => {
