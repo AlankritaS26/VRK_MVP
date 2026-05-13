@@ -20,7 +20,7 @@ THRESHOLD      = int(os.getenv('PASSERBY_THRESHOLD',  80))
 FRAME_WINDOW   = int(os.getenv('FRAME_WINDOW',        10))
 WALK_AWAY_SEC  = int(os.getenv('WALK_AWAY_SECONDS',    5))
 CAM_INDEX      = int(os.getenv('CAMERA_INDEX',         0))
-CONFIDENCE_MAX = float(os.getenv('FACE_CONFIDENCE',   70))
+CONFIDENCE_MAX = 55.0
 
 FACES_DIR   = Path("faces");   FACES_DIR.mkdir(exist_ok=True)
 MODEL_PATH  = Path("face_model.yml")
@@ -126,7 +126,7 @@ def ask_name_on_screen():
     """Tell frontend to show the name input form."""
     post('/visitor/unknown')
 
-def poll_name_response(timeout=30) -> tuple[str, bool]:
+def poll_name_response(timeout=60) -> tuple[str, bool]:
     """
     Poll backend for the name the visitor typed on screen.
     Returns (name, save_to_db).
@@ -252,7 +252,7 @@ def run():
                     # ── Unknown — ask name on screen ──────────────────────────
                     if not recognized:
                         ask_name_on_screen()          # shows form on React
-                        name, save_to_db = poll_name_response(timeout=30)
+                        name, save_to_db = poll_name_response(timeout=60)
 
                         if save_to_db and name != "Guest":
                             face_id  = hashlib.sha256(

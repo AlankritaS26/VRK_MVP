@@ -302,10 +302,51 @@ async def get_messages(session_id: str, after: int = 0):
 
 visitor_name_response: dict = {"ready": False, "name": "", "save": True}
 
+
+@app.post("/visitor/delete_my_data")
+async def delete_my_data(name: str):
+    import shutil
+    from pathlib import Path
+    BASE = Path(__file__).parent
+    deleted = False
+    try:
+        labels_path = BASE / "face_labels.json"
+        if labels_path.exists():
+            with open(labels_path) as f:
+                label_map = json.load(f)
+            to_delete = [k for k, v in label_map.items() if v.get("name","").lower() == name.lower()]
+            for key in to_delete:
+                face_id = label_map[key].get("face_id","")
+                face_dir = BASE / "faces" / face_id
+                if face_dir.exists():
+                    shutil.rmtree(face_dir)
+                del label_map[key]
+                deleted = True
+            with open(labels_path, "w") as f:
+                json.dump(label_map, f, indent=2)
+            model_path = BASE / "trainer.yml"
+            if not label_map and model_path.exists():
+                model_path.unlink()
+        if deleted:
+            return {"success": True, "message": f"Data for {name} deleted."}
+        else:
+            return {"success": False, "message": f"No data found for {name}."}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
 @app.post("/visitor/unknown")
 async def visitor_unknown():
-    global visitor_name_response
+    global visitor_name_response, active_session
     visitor_name_response = {"ready": False, "name": "", "save": True}
+    if active_session is None:
+        active_session = {
+            "session_id": str(uuid.uuid4()),
+            "user_name": "Unknown",
+            "is_returning": False,
+            "visit_count": 1,
+            "asking_name": True
+        }
+    else:
+        active_session["asking_name"] = True
     await manager.broadcast({"type": "ask_name"})
     return {"status": "asking"}
 
@@ -313,6 +354,8 @@ async def visitor_unknown():
 async def submit_name(name: str = "", save: bool = True):
     global visitor_name_response
     visitor_name_response = {"ready": True, "name": name, "save": save}
+    if active_session:
+        active_session["asking_name"] = False
     await manager.broadcast({"type": "name_received", "name": name, "save": save})
     return {"status": "received"}
 
