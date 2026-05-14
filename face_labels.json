@@ -13,6 +13,13 @@
     "last_seen": "2026-05-13T14:26:35.492183",
     "visit_count": 7
   },
+  "3": {
+    "name": "akshu",
+    "face_id": "e85bd1d3c4b7",
+    "registered": "2026-05-13T14:30:32.382446",
+    "last_seen": "2026-05-13T14:33:08.999510",
+    "visit_count": 2
+  },
   "4": {
     "name": "sneha",
     "face_id": "112eda98270a",
@@ -20,25 +27,11 @@
     "last_seen": "2026-05-13T14:32:40.599234",
     "visit_count": 1
   },
-  "6": {
-    "name": "hello",
-    "face_id": "d43d126a11f3",
-    "registered": "2026-05-14T15:03:53.748139",
-    "last_seen": "2026-05-14T15:07:08.798918",
-    "visit_count": 4
-  },
-  "7": {
-    "name": "akshu",
-    "face_id": "fa64bc94cf20",
-    "registered": "2026-05-14T15:11:46.078548",
-    "last_seen": "2026-05-14T15:11:46.078568",
-    "visit_count": 1
-  },
-  "8": {
-    "name": "akshu",
-    "face_id": "f75ee69fbf49",
-    "registered": "2026-05-14T15:16:33.851123",
-    "last_seen": "2026-05-14T15:21:51.323455",
+  "5": {
+    "name": "sneha",
+    "face_id": "ed7204c07c41",
+    "registered": "2026-05-14T14:56:11.589247",
+    "last_seen": "2026-05-14T14:59:21.081733",
     "visit_count": 2
   }
 }

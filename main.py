@@ -122,18 +122,42 @@ def test_memory(name: str):
     return {"message": f"I will remember you for 60 seconds, {name}!"}
 
 @app.get("/ask")
-def ask_kiosk(question: str = Query(..., description="question")):
+async def ask_kiosk(question: str = Query(..., description="question")):
+    global active_session  # ← required so we can set active_session = None
+
     with open("data/college_info.json", encoding="utf-8") as f:
         data = json.load(f)
 
     q = question.lower().strip()
-    stop_words = {"is","the","where","can","you","tell","me","who","what","how","of","in","at","a","an","are","was","i","do","does","please","to","find","get","go","about","any","have","which","when"}
+
+    # ── 1. Greetings (early return, no DB log needed) ──────────────────────
+    if any(greet in q for greet in ["hello", "hi", "hey", "good morning"]):
+        return {"question": question, "answer": "Hello! Welcome to RNSIT. How can I help you today?"}
+
+    # ── 2. Session end (thank you / goodbye) ───────────────────────────────
+    if any(thanks in q for thanks in ["thank you", "thanks", "tysm", "that's all"]):
+        session_id = active_session["session_id"] if active_session else None
+        active_session = None
+        await manager.broadcast({"type": "session_end", "session_id": session_id})
+        return {
+            "question": question,
+            "answer": "You're very welcome! Have a great day at RNSIT. Session closed.",
+            "session_ended": True
+        }
+
+    # ── 3. Keyword scoring ─────────────────────────────────────────────────
+    stop_words = {
+        "is", "the", "where", "can", "you", "tell", "me", "who", "what",
+        "how", "of", "in", "at", "a", "an", "are", "was", "i", "do",
+        "does", "please", "to", "find", "get", "go", "about", "any",
+        "have", "which", "when"
+    }
     words = [w for w in q.split() if w not in stop_words and len(w) > 2]
 
     answer = None
     best = 0
 
-    # FAQs - score by question match only
+    # FAQs
     for faq in data.get("faqs", []):
         fq = faq["question"].lower()
         score = sum(2 for w in words if w in fq)
@@ -141,7 +165,7 @@ def ask_kiosk(question: str = Query(..., description="question")):
             best = score
             answer = faq["answer"]
 
-    # Facilities - direct keyword match beats FAQ if score low
+    # Facilities
     for fname, fval in data.get("facilities", {}).items():
         if fname in q or any(w in fname for w in words):
             if isinstance(fval, dict):
@@ -162,17 +186,17 @@ def ask_kiosk(question: str = Query(..., description="question")):
     # Departments
     if best < 2:
         for dept, details in data.get("departments", {}).items():
-            dc = dept.replace("_"," ").lower()
+            dc = dept.replace("_", " ").lower()
             if any(w in dc for w in words) or dc in q:
                 if isinstance(details, dict):
-                    if any(w in q for w in ["hod","head","who"]):
-                        answer = "HOD of " + dept.upper() + " is " + str(details.get("hod","not listed")) + "."
-                    elif any(w in q for w in ["intake","seats","students"]):
-                        answer = dept.upper() + " has intake of " + str(details.get("intake","180")) + " students."
-                    elif any(w in q for w in ["floor","location","where","block"]):
-                        answer = dept.upper() + " is on " + str(details.get("floor","ground floor")) + "."
+                    if any(w in q for w in ["hod", "head", "who"]):
+                        answer = "HOD of " + dept.upper() + " is " + str(details.get("hod", "not listed")) + "."
+                    elif any(w in q for w in ["intake", "seats", "students"]):
+                        answer = dept.upper() + " has intake of " + str(details.get("intake", "180")) + " students."
+                    elif any(w in q for w in ["floor", "location", "where", "block"]):
+                        answer = dept.upper() + " is on " + str(details.get("floor", "ground floor")) + "."
                     else:
-                        answer = dept.upper() + " - Floor: " + str(details.get("floor","")) + ", HOD: " + str(details.get("hod","")) + "."
+                        answer = dept.upper() + " - Floor: " + str(details.get("floor", "")) + ", HOD: " + str(details.get("hod", "")) + "."
                 best = 2
                 break
 
@@ -188,7 +212,7 @@ def ask_kiosk(question: str = Query(..., description="question")):
     # Administration
     if best < 2:
         for key, val in data.get("administration", {}).items():
-            kc = key.replace("_"," ").lower()
+            kc = key.replace("_", " ").lower()
             if any(w in kc for w in words):
                 if isinstance(val, dict):
                     name = val.get("name", "")
@@ -199,25 +223,25 @@ def ask_kiosk(question: str = Query(..., description="question")):
                 best = 2
                 break
 
+    # Fallback
     if not answer:
         answer = "I am sorry, I do not have that information. Please visit the Admin Block."
 
-    greeting = ""
-    if any(w in q for w in ["hello","hi","hey"]):
-        greeting = "Hello! Welcome to RNSIT. "
-
+    # ── 4. Log to DB ───────────────────────────────────────────────────────
     try:
         db_conn = get_db_connection()
         cur = db_conn.cursor()
-        cur.execute("INSERT INTO interactions (input_text, response_text) VALUES (%s, %s)", (str(question), str(answer)))
+        cur.execute(
+            "INSERT INTO interactions (input_text, response_text) VALUES (%s, %s)",
+            (str(question), str(answer))
+        )
         db_conn.commit()
         cur.close()
         db_conn.close()
     except Exception as e:
         print(f"DB log failed: {e}")
 
-    return {"question": question, "answer": greeting + answer}
-
+    return {"question": question, "answer": answer}
 # --- Slice 1/2 Session & Face Endpoints ---
 @app.get("/session/current")
 async def get_current_session():
