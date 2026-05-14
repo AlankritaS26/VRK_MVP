@@ -1,0 +1,38 @@
+{
+  "session_id": "70e06e0a-ddd6-4b8a-bc00-b5c9c23bf2f1",
+  "user_name": "hello",
+  "started_at": "2026-05-14T15:03:59.950752",
+  "ended_at": "2026-05-14T15:05:16.159446",
+  "transcript": [
+    {
+      "speaker": "user",
+      "text": "Welcome. Hello on this your mother.",
+      "timestamp": "2026-05-14T15:04:33.749040"
+    },
+    {
+      "speaker": "kiosk",
+      "text": "Hello! Welcome to RNSIT. I am sorry, I do not have that information. Please visit the Admin Block.",
+      "timestamp": "2026-05-14T15:04:33.776469"
+    },
+    {
+      "speaker": "user",
+      "text": "How to go to?",
+      "timestamp": "2026-05-14T15:04:48.224643"
+    },
+    {
+      "speaker": "kiosk",
+      "text": "I am sorry, I do not have that information. Please visit the Admin Block.",
+      "timestamp": "2026-05-14T15:04:48.255269"
+    },
+    {
+      "speaker": "user",
+      "text": "Library.",
+      "timestamp": "2026-05-14T15:04:57.540375"
+    },
+    {
+      "speaker": "kiosk",
+      "text": "RNSIT Central Library. Location: Opposite the Administrative Block. Timings: 09:00 AM to 08:00 PM",
+      "timestamp": "2026-05-14T15:04:57.568258"
+    }
+  ]
+}

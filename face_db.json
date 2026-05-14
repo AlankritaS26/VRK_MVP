@@ -70,5 +70,50 @@
     "registered_at": "2026-05-13T14:32:43.497531",
     "last_seen": "2026-05-13T14:32:43.497549",
     "visit_count": 1
+  },
+  "bee2b2bdc706": {
+    "name": "akshu",
+    "encoding": [
+      5.0
+    ],
+    "registered_at": "2026-05-14T14:56:03.655843",
+    "last_seen": "2026-05-14T14:56:03.655877",
+    "visit_count": 1
+  },
+  "d43d126a11f3": {
+    "name": "hello",
+    "encoding": [
+      6.0
+    ],
+    "registered_at": "2026-05-14T15:03:59.417942",
+    "last_seen": "2026-05-14T15:03:59.417965",
+    "visit_count": 1
+  },
+  "ef9d33873d30": {
+    "name": "akshu",
+    "encoding": [
+      7.0
+    ],
+    "registered_at": "2026-05-14T15:08:45.870320",
+    "last_seen": "2026-05-14T15:08:45.870333",
+    "visit_count": 1
+  },
+  "fa64bc94cf20": {
+    "name": "akshu",
+    "encoding": [
+      7.0
+    ],
+    "registered_at": "2026-05-14T15:11:49.442895",
+    "last_seen": "2026-05-14T15:11:49.442920",
+    "visit_count": 1
+  },
+  "f75ee69fbf49": {
+    "name": "akshu",
+    "encoding": [
+      8.0
+    ],
+    "registered_at": "2026-05-14T15:16:37.545542",
+    "last_seen": "2026-05-14T15:16:37.545555",
+    "visit_count": 1
   }
 }

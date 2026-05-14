@@ -1,0 +1,18 @@
+{
+  "session_id": "acf399fc-9be0-4d97-9f83-ddab978681fb",
+  "user_name": "Unknown",
+  "started_at": "2026-05-14T15:01:02.344999",
+  "ended_at": null,
+  "transcript": [
+    {
+      "speaker": "user",
+      "text": "Welcome. How may I assist you today?",
+      "timestamp": "2026-05-14T15:02:07.259446"
+    },
+    {
+      "speaker": "kiosk",
+      "text": "I am sorry, I do not have that information. Please visit the Admin Block.",
+      "timestamp": "2026-05-14T15:02:08.324534"
+    }
+  ]
+}

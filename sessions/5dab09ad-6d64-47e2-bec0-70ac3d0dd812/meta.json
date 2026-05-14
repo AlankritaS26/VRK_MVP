@@ -1,0 +1,48 @@
+{
+  "session_id": "5dab09ad-6d64-47e2-bec0-70ac3d0dd812",
+  "user_name": "akshu",
+  "started_at": "2026-05-14T15:11:50.017270",
+  "ended_at": "2026-05-14T15:15:09.570933",
+  "transcript": [
+    {
+      "speaker": "user",
+      "text": "Who is the founder of RNSIT?",
+      "timestamp": "2026-05-14T15:13:40.437505"
+    },
+    {
+      "speaker": "kiosk",
+      "text": "Dr. Ramesh Babu H S is the current Principal.",
+      "timestamp": "2026-05-14T15:13:40.460552"
+    },
+    {
+      "speaker": "user",
+      "text": "How do I find library?",
+      "timestamp": "2026-05-14T15:13:50.656138"
+    },
+    {
+      "speaker": "kiosk",
+      "text": "RNSIT Central Library. Location: Opposite the Administrative Block. Timings: 09:00 AM to 08:00 PM",
+      "timestamp": "2026-05-14T15:13:51.700667"
+    },
+    {
+      "speaker": "user",
+      "text": "Find Canteen.",
+      "timestamp": "2026-05-14T15:14:05.030069"
+    },
+    {
+      "speaker": "kiosk",
+      "text": "Location: Near the sports ground and hostel entrance",
+      "timestamp": "2026-05-14T15:14:05.051742"
+    },
+    {
+      "speaker": "user",
+      "text": "How do I go to see ground?",
+      "timestamp": "2026-05-14T15:14:17.321112"
+    },
+    {
+      "speaker": "kiosk",
+      "text": "I am sorry, I do not have that information. Please visit the Admin Block.",
+      "timestamp": "2026-05-14T15:14:17.346619"
+    }
+  ]
+}

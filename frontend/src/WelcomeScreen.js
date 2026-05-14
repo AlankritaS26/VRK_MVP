@@ -3,11 +3,11 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 const BACKEND = process.env.REACT_APP_BACKEND_URL || 'http://127.0.0.1:8000';
 
 export default function WelcomeScreen({ session, messages, setMessages, askingName }) {
-  const scrollRef     = useRef(null);
-  const inputRef      = useRef(null);
-  const isMounted     = useRef(true);
-  const isSpeaking    = useRef(false);
-  const isListening   = useRef(false);
+  const scrollRef      = useRef(null);
+  const inputRef       = useRef(null);
+  const isMounted      = useRef(true);
+  const isSpeaking     = useRef(false);
+  const isListening    = useRef(false);
   const lastTranscript = useRef('');
 
   const [name,       setName]       = useState('');
@@ -19,20 +19,20 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const [liveText,   setLiveText]   = useState('');
   const [listening,  setListening]  = useState(false);
 
-  const visitorName = session?.user_name || 'Guest';
+  const visitorName = session?.user_name    || 'Guest';
   const isReturning = session?.is_returning || false;
   const visitCount  = session?.visit_count  || 1;
 
   const greeting = isReturning
     ? visitCount > 2
-      ? 'Great to see you again, ' + visitorName + '!'
-      : 'Hey ' + visitorName + '! Welcome back!'
-    : 'Hello, ' + visitorName + '! Welcome to RNS Institute!';
+      ? 'Welcome back, ' + visitorName + '! Great to see you again.'
+      : 'Welcome back, ' + visitorName + '!'
+    : 'Welcome, ' + visitorName + '! How may I assist you today?';
 
   useEffect(() => {
     if (scrollRef.current)
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-  }, [messages]);
+      scrollRef.current.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
+  }, [messages, liveText]);
 
   useEffect(() => {
     isMounted.current = true;
@@ -48,8 +48,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
   const addMessage = useCallback((text, speaker) => {
     setMessages(prev => [...prev, {
-      text,
-      speaker,
+      text, speaker,
       timestamp: new Date().toLocaleTimeString()
     }]);
   }, [setMessages]);
@@ -58,26 +57,20 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     if (!isMounted.current) return;
     if (isListening.current) return;
     if (isSpeaking.current) return;
-
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SR) return;
-
     const recog           = new SR();
     recog.lang            = 'en-US';
     recog.continuous      = false;
     recog.interimResults  = true;
-    recog.onsoundstart = () => { if (isMounted.current) setListening(true); };
     recog.maxAlternatives = 1;
-
     recog.onstart = () => {
       isListening.current = true;
       lastTranscript.current = '';
       if (isMounted.current) { setListening(true); setLiveText(''); }
     };
-
     recog.onresult = (e) => {
-      let interim = '';
-      let final   = '';
+      let interim = '', final = '';
       for (let i = 0; i < e.results.length; i++) {
         const t = e.results[i][0].transcript;
         if (e.results[i].isFinal) final += t;
@@ -87,31 +80,20 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       lastTranscript.current = display;
       if (isMounted.current) setLiveText(display);
     };
-
     recog.onerror = (e) => {
       isListening.current = false;
-      if (isMounted.current) { setListening(false); }
-      if (e.error !== 'no-speech' && e.error !== 'aborted') {
-        console.error('[STT]', e.error);
-      }
-      if (!isSpeaking.current && isMounted.current) {
-        setTimeout(startListening, 400);
-      }
+      if (isMounted.current) setListening(false);
+      if (e.error !== 'no-speech' && e.error !== 'aborted') console.error('[STT]', e.error);
+      if (!isSpeaking.current && isMounted.current) setTimeout(startListening, 400);
     };
-
     recog.onend = () => {
       isListening.current = false;
       if (isMounted.current) setListening(false);
       const heard = lastTranscript.current.trim();
-      if (heard && !isSpeaking.current) {
-        sendToBackend(heard);
-      } else if (!isSpeaking.current && isMounted.current) {
-        setTimeout(startListening, 400);
-      }
+      if (heard && !isSpeaking.current) sendToBackend(heard);
+      else if (!isSpeaking.current && isMounted.current) setTimeout(startListening, 400);
     };
-
     try { recog.start(); } catch(e) { console.error(e); }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const sendToBackend = useCallback(async (text) => {
@@ -130,7 +112,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         fetch(BACKEND + '/ask?question=' + encodeURIComponent(text))
       ]);
       const data   = await askRes.json();
-      const answer = data.answer || 'Sorry, I do not have that information.';
+      const answer = data.answer || 'Sorry, I do not have that information. Please visit the Admin Block.';
       addMessage(answer, 'kiosk');
       fetch(BACKEND + '/message', {
         method: 'POST',
@@ -150,7 +132,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     isSpeaking.current = true;
     const utter  = new SpeechSynthesisUtterance(text);
     utter.lang   = 'en-US';
-    utter.rate   = 1.1;
+    utter.rate   = 1.0;
     utter.volume = 1;
     utter.onend = () => {
       isSpeaking.current = false;
@@ -165,7 +147,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
   useEffect(() => {
     if (askingName) return;
-    const t = setTimeout(startListening, 400);
+    const t = setTimeout(startListening, 300);
     return () => clearTimeout(t);
   }, [askingName, startListening]);
 
@@ -188,92 +170,106 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     } catch(e) { console.error(e); }
   };
 
+  const inputStyle = {
+    width: '100%',
+    padding: '12px 16px',
+    border: '1.5px solid #c5cae9',
+    borderRadius: '8px',
+    fontSize: '15px',
+    boxSizing: 'border-box',
+    outline: 'none',
+    color: '#1a237e',
+    background: '#f8f9ff',
+    transition: 'border 0.2s'
+  };
+
+  const btnPrimary = {
+    padding: '11px 24px',
+    border: 'none',
+    borderRadius: '8px',
+    background: '#1a237e',
+    color: '#fff',
+    cursor: 'pointer',
+    fontSize: '14px',
+    fontWeight: '600',
+    letterSpacing: '0.3px'
+  };
+
+  const btnSecondary = {
+    padding: '11px 24px',
+    border: '1.5px solid #c5cae9',
+    borderRadius: '8px',
+    background: '#fff',
+    color: '#555',
+    cursor: 'pointer',
+    fontSize: '14px'
+  };
+
   return (
-    <div className="welcome-screen">
-      <div className="welcome-bg" />
-      <div className="grid-overlay" />
-      <header className="welcome-header">
-        <div className="header-logo-row">
-          <svg className="header-rns" viewBox="0 0 200 60" xmlns="http://www.w3.org/2000/svg">
-            <defs>
-              <linearGradient id="hGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-                <stop offset="0%" stopColor="#00e5ff" />
-                <stop offset="100%" stopColor="#2979ff" />
-              </linearGradient>
-            </defs>
-            <text x="2" y="55" fontFamily="Arial Black,sans-serif"
-              fontSize="58" fontWeight="900" fill="url(#hGrad)" letterSpacing="-1">RNS</text>
-          </svg>
-          <div className="header-titles">
-            <div className="header-main">Digital Receptionist</div>
-            <div className="header-sub">RNS Institute of Technology</div>
+    <div style={{ minHeight: '100vh', background: '#f5f6fa', fontFamily: "'Segoe UI', Arial, sans-serif", display: 'flex', flexDirection: 'column' }}>
+
+      {/* Header */}
+      <header style={{ background: '#ffffff', borderBottom: '2px solid #e8eaf6', padding: '14px 32px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', boxShadow: '0 2px 10px rgba(26,35,126,0.07)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+          <img src="/rnslogo.webp" alt="RNSIT" style={{ height: '56px', objectFit: 'contain' }} />
+          <div>
+            <div style={{ fontSize: '18px', fontWeight: '800', color: '#1a237e', letterSpacing: '0.3px' }}>RNS Institute of Technology</div>
+            <div style={{ fontSize: '12px', color: '#888', marginTop: '2px', letterSpacing: '0.5px' }}>DIGITAL RECEPTIONIST — INTERACTIVE KIOSK</div>
           </div>
         </div>
-        {!askingName && (
-          <div className="greeting-banner">
-            <span className="greeting-text">{greeting}</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '20px' }}>
+          <div style={{ textAlign: 'right' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', justifyContent: 'flex-end' }}>
+              <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#43a047' }} />
+              <span style={{ fontSize: '12px', color: '#43a047', fontWeight: '600' }}>Session Active</span>
+            </div>
+            <div style={{ fontSize: '11px', color: '#bbb', fontFamily: 'monospace', marginTop: '2px' }}>{(session?.session_id || '').slice(0,20)}...</div>
           </div>
-        )}
-        <div className="header-bottom">
-          <div className="session-pill">
-            <span className="session-dot" />
-            <span>Session Active</span>
-            <span className="session-id">{session?.session_id || 'pending...'}</span>
-          </div>
-          <button className="privacy-btn" onClick={() => setDeleteMode(d => !d)}>Delete My Data</button>
+          <button onClick={() => setDeleteMode(d => !d)} style={{ background: '#fff5f5', border: '1.5px solid #ef9a9a', color: '#c62828', borderRadius: '8px', padding: '9px 18px', fontSize: '13px', cursor: 'pointer', fontWeight: '600' }}>
+            Delete My Data
+          </button>
         </div>
       </header>
 
+      {/* Greeting strip */}
+      {!askingName && (
+        <div style={{ background: 'linear-gradient(90deg, #1a237e, #283593)', color: '#fff', padding: '11px 32px', fontSize: '14px', fontWeight: '500', display: 'flex', alignItems: 'center', gap: '10px' }}>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#90caf9" strokeWidth="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/></svg>
+          {greeting}
+        </div>
+      )}
+
+      {/* Delete Modal */}
       {deleteMode && (
-        <div className="modal-overlay" onClick={e => e.target === e.currentTarget && setDeleteMode(false)}>
-          <div className="modal-card">
+        <div onClick={e => e.target === e.currentTarget && setDeleteMode(false)}
+          style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.35)', zIndex: 200, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <div style={{ background: '#fff', borderRadius: '16px', padding: '40px', width: '420px', boxShadow: '0 12px 48px rgba(0,0,0,0.18)' }}>
             {deleted ? (
-              <div className="modal-success">
-                <div className="modal-title">Data Deleted</div>
-                <p className="modal-sub">Your face data has been permanently removed.</p>
-              </div>
-            ) : (
-              <>
-                <div className="modal-title">Delete My Data</div>
-                <p className="modal-sub">Enter your name to permanently remove your face data.</p>
-                <input className="modal-input" placeholder="Enter your name" value={deleteName}
-                  onChange={e => setDeleteName(e.target.value)}
-                  onKeyDown={e => e.key === 'Enter' && handleDeleteData()} autoFocus />
-                <div className="modal-buttons">
-                  <button className="btn-secondary" onClick={() => setDeleteMode(false)}>Cancel</button>
-                  <button className="btn-danger" onClick={handleDeleteData}>Delete Permanently</button>
+              <div style={{ textAlign: 'center' }}>
+                <div style={{ width: '64px', height: '64px', borderRadius: '50%', background: '#e8f5e9', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
+                  <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#43a047" strokeWidth="2.5"><polyline points="20 6 9 17 4 12"/></svg>
                 </div>
-              </>
-            )}
-          </div>
-        </div>
-      )}
-
-      {askingName && !deleteMode && (
-        <div className="modal-overlay">
-          <div className="modal-card">
-            {submitted ? (
-              <div className="modal-success">
-                <div className="modal-title">{saveData ? 'Nice to meet you, ' + (name || 'Guest') + '!' : 'Welcome, Guest!'}</div>
-                <p className="modal-sub">{saveData ? 'Your face has been saved. I will recognize you next time!' : 'No data saved. Enjoy your visit!'}</p>
+                <div style={{ fontSize: '20px', fontWeight: '700', color: '#1a237e' }}>Data Deleted Successfully</div>
+                <p style={{ color: '#666', marginTop: '8px', fontSize: '14px' }}>Your face data has been permanently removed from the system.</p>
               </div>
             ) : (
               <>
-                <div className="modal-title">Hello! I do not think we have met.</div>
-                <p className="modal-sub">What is your name?</p>
-                <input ref={inputRef} className="modal-input" placeholder="Type your name"
-                  value={name} onChange={e => setName(e.target.value)}
-                  onKeyDown={e => e.key === 'Enter' && handleSubmitName()} autoFocus />
-                <label className="privacy-toggle">
-                  <div className={'toggle-track ' + (saveData ? 'on' : 'off')} onClick={() => setSaveData(s => !s)}>
-                    <div className="toggle-thumb" />
+                <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px' }}>
+                  <div style={{ width: '44px', height: '44px', borderRadius: '50%', background: '#ffebee', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#c62828" strokeWidth="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4h6v2"/></svg>
                   </div>
-                  <span className="toggle-label">{saveData ? 'Remember me for next time' : 'Do not save my info'}</span>
-                </label>
-                {!saveData && <p className="privacy-note">You will be greeted as a Guest. No face data will be stored.</p>}
-                <div className="modal-buttons">
-                  <button className="btn-secondary" onClick={() => handleSubmitName('Guest', false)}>Skip</button>
-                  <button className="btn-primary" onClick={() => handleSubmitName()}>{saveData ? 'Remember Me' : 'Continue as Guest'}</button>
+                  <div>
+                    <div style={{ fontSize: '17px', fontWeight: '700', color: '#c62828' }}>Delete My Data</div>
+                    <div style={{ fontSize: '12px', color: '#999' }}>This action cannot be undone</div>
+                  </div>
+                </div>
+                <p style={{ color: '#666', marginBottom: '16px', fontSize: '14px', lineHeight: '1.6' }}>Enter your registered name to permanently remove your face data from the system.</p>
+                <input style={inputStyle} placeholder="Enter your registered name"
+                  value={deleteName} onChange={e => setDeleteName(e.target.value)}
+                  onKeyDown={e => e.key === 'Enter' && handleDeleteData()} autoFocus />
+                <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end', marginTop: '20px' }}>
+                  <button onClick={() => setDeleteMode(false)} style={btnSecondary}>Cancel</button>
+                  <button onClick={handleDeleteData} style={{ ...btnPrimary, background: '#c62828' }}>Delete Permanently</button>
                 </div>
               </>
             )}
@@ -281,39 +277,141 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         </div>
       )}
 
-      <div className="chat-area" ref={scrollRef}>
+      {/* Name Modal */}
+      {askingName && !deleteMode && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.35)', zIndex: 200, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <div style={{ background: '#fff', borderRadius: '16px', padding: '40px', width: '440px', boxShadow: '0 12px 48px rgba(0,0,0,0.18)' }}>
+            {submitted ? (
+              <div style={{ textAlign: 'center' }}>
+                <div style={{ width: '64px', height: '64px', borderRadius: '50%', background: '#e8eaf6', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
+                  <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#1a237e" strokeWidth="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+                </div>
+                <div style={{ fontSize: '20px', fontWeight: '700', color: '#1a237e' }}>
+                  {saveData ? 'Welcome, ' + (name || 'Guest') + '!' : 'Welcome, Guest!'}
+                </div>
+                <p style={{ color: '#666', marginTop: '10px', fontSize: '14px', lineHeight: '1.6' }}>
+                  {saveData ? 'Your face has been registered. We will recognize you on your next visit.' : 'You are visiting as a guest. No data has been saved.'}
+                </p>
+              </div>
+            ) : (
+              <>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '20px' }}>
+                  <div style={{ width: '44px', height: '44px', borderRadius: '50%', background: '#e8eaf6', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#1a237e" strokeWidth="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+                  </div>
+                  <div>
+                    <div style={{ fontSize: '18px', fontWeight: '700', color: '#1a237e' }}>Hello! Welcome to RNSIT</div>
+                    <div style={{ fontSize: '13px', color: '#888' }}>We do not recognize you yet</div>
+                  </div>
+                </div>
+
+                <div style={{ marginBottom: '16px' }}>
+                  <label style={{ fontSize: '13px', fontWeight: '600', color: '#444', display: 'block', marginBottom: '6px' }}>Your Full Name</label>
+                  <input ref={inputRef} style={inputStyle}
+                    placeholder="e.g. Akshatha A"
+                    value={name} onChange={e => setName(e.target.value)}
+                    onKeyDown={e => e.key === 'Enter' && handleSubmitName()} autoFocus />
+                </div>
+
+                {/* Toggle */}
+                <div style={{ background: '#f8f9ff', border: '1.5px solid #e8eaf6', borderRadius: '10px', padding: '14px 16px', marginBottom: '20px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <div>
+                      <div style={{ fontSize: '13px', fontWeight: '600', color: '#333' }}>Remember me for next visit</div>
+                      <div style={{ fontSize: '12px', color: '#999', marginTop: '2px' }}>{saveData ? 'Your face will be saved securely' : 'No data will be stored'}</div>
+                    </div>
+                    <div onClick={() => setSaveData(s => !s)} style={{ width: '48px', height: '26px', borderRadius: '13px', background: saveData ? '#1a237e' : '#ddd', cursor: 'pointer', position: 'relative', transition: 'background 0.25s', flexShrink: 0 }}>
+                      <div style={{ position: 'absolute', top: '3px', left: saveData ? '25px' : '3px', width: '20px', height: '20px', borderRadius: '50%', background: '#fff', transition: 'left 0.25s', boxShadow: '0 1px 4px rgba(0,0,0,0.2)' }} />
+                    </div>
+                  </div>
+                </div>
+
+                <div style={{ display: 'flex', gap: '10px' }}>
+                  <button onClick={() => handleSubmitName('Guest', false)} style={{ ...btnSecondary, flex: 1 }}>Continue as Guest</button>
+                  <button onClick={() => handleSubmitName()} style={{ ...btnPrimary, flex: 1 }}>{saveData ? 'Register & Continue' : 'Continue'}</button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Chat Area */}
+      <div ref={scrollRef} style={{ flex: '1 1 0', overflowY: 'auto', minHeight: 0, padding: '28px 32px', display: 'flex', flexDirection: 'column', gap: '16px', maxWidth: '900px', width: '100%', margin: '0 auto', alignSelf: 'stretch' }}>
         {messages.length === 0 && !liveText ? (
-          <div className="chat-empty">
-            <div className="listen-bars">
-              {[1,2,3,4,5].map(i => <div key={i} className={'bar bar' + i} />)}
+          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '16px', paddingTop: '60px' }}>
+            <div style={{ width: '72px', height: '72px', borderRadius: '50%', background: '#e8eaf6', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+              <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#1a237e" strokeWidth="1.5">
+                <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+                <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                <line x1="12" y1="19" x2="12" y2="23"/>
+                <line x1="8" y1="23" x2="16" y2="23"/>
+              </svg>
             </div>
-            <p>{listening ? 'Listening...' : 'Starting microphone...'}</p>
+            <div style={{ fontSize: '17px', fontWeight: '700', color: '#1a237e' }}>{listening ? 'Listening...' : 'Ready to assist you'}</div>
+            <div style={{ fontSize: '14px', color: '#aaa', textAlign: 'center', maxWidth: '300px', lineHeight: '1.6' }}>
+              {listening ? 'Please speak your question clearly' : 'Ask me anything about RNSIT — departments, facilities, timings, and more'}
+            </div>
+            {listening && (
+              <div style={{ display: 'flex', gap: '6px', alignItems: 'center', marginTop: '8px' }}>
+                {[0,1,2,3,4].map(i => (
+                  <div key={i} style={{ width: '4px', borderRadius: '2px', background: '#1a237e', animation: 'wave 1.2s infinite ease-in-out', animationDelay: i * 0.12 + 's', height: '20px' }} />
+                ))}
+              </div>
+            )}
           </div>
         ) : (
           <>
             {messages.map((msg, i) => (
-              <div key={i} className={'bubble ' + (msg.speaker === 'kiosk' ? 'bubble-kiosk' : 'bubble-user')}>
-                <div className="bubble-speaker">{msg.speaker === 'kiosk' ? 'Kiosk' : visitorName}</div>
-                <div className="bubble-text">{msg.text}</div>
-                <div className="bubble-time">{msg.timestamp}</div>
+              <div key={i} style={{ display: 'flex', flexDirection: 'column', alignItems: msg.speaker === 'kiosk' ? 'flex-start' : 'flex-end' }}>
+                <div style={{ fontSize: '11px', color: '#bbb', marginBottom: '4px', paddingLeft: msg.speaker === 'kiosk' ? '4px' : 0, paddingRight: msg.speaker !== 'kiosk' ? '4px' : 0, fontWeight: '500' }}>
+                  {msg.speaker === 'kiosk' ? 'RNSIT Kiosk' : visitorName} &nbsp;·&nbsp; {msg.timestamp}
+                </div>
+                <div style={{
+                  maxWidth: '60%',
+                  padding: '14px 18px',
+                  borderRadius: msg.speaker === 'kiosk' ? '4px 18px 18px 18px' : '18px 4px 18px 18px',
+                  background: msg.speaker === 'kiosk' ? '#ffffff' : '#1a237e',
+                  color: msg.speaker === 'kiosk' ? '#222' : '#ffffff',
+                  border: msg.speaker === 'kiosk' ? '1.5px solid #e8eaf6' : 'none',
+                  fontSize: '14px',
+                  lineHeight: '1.65',
+                  boxShadow: msg.speaker === 'kiosk' ? '0 2px 8px rgba(0,0,0,0.06)' : '0 2px 8px rgba(26,35,126,0.18)'
+                }}>
+                  {msg.text}
+                </div>
               </div>
             ))}
             {liveText && (
-              <div className="bubble bubble-user" style={{ opacity: 0.6, fontStyle: 'italic' }}>
-                <div className="bubble-speaker">{visitorName} (speaking...)</div>
-                <div className="bubble-text">{liveText}</div>
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
+                <div style={{ fontSize: '11px', color: '#bbb', marginBottom: '4px', paddingRight: '4px' }}>{visitorName} (speaking...)</div>
+                <div style={{ maxWidth: '60%', padding: '14px 18px', borderRadius: '18px 4px 18px 18px', background: '#e8eaf6', color: '#1a237e', fontSize: '14px', fontStyle: 'italic', lineHeight: '1.65', border: '1.5px solid #c5cae9' }}>
+                  {liveText}
+                </div>
               </div>
             )}
           </>
         )}
       </div>
 
-      <footer className="welcome-footer">
-        <span className="footer-hint">{listening ? 'Listening...' : 'Mic ready...'}</span>
-        <div className="footer-bars">
-          {[1,2,3,4,5].map(i => <div key={i} className={'bar bar' + i} />)}
+      {/* Footer */}
+      <footer style={{ background: '#ffffff', borderTop: '1.5px solid #e8eaf6', padding: '12px 32px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', boxShadow: '0 -2px 8px rgba(26,35,126,0.05)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+          <div style={{ width: '10px', height: '10px', borderRadius: '50%', background: listening ? '#43a047' : '#ffb300', transition: 'background 0.3s', animation: listening ? 'pulse 1.5s infinite' : 'none' }} />
+          <span style={{ fontSize: '13px', color: '#555', fontWeight: '500' }}>{listening ? 'Listening — please speak your question' : 'Microphone ready'}</span>
         </div>
+        <div style={{ fontSize: '12px', color: '#bbb' }}>RNSIT Digital Receptionist &nbsp;·&nbsp; Bengaluru — 560098</div>
       </footer>
+
+      <style>{`
+        @keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:0.5;transform:scale(1.4)} }
+        @keyframes wave { 0%,100%{height:8px} 50%{height:24px} }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        input:focus { border-color: #1a237e !important; box-shadow: 0 0 0 3px rgba(26,35,126,0.1); }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: #f5f6fa; }
+        ::-webkit-scrollbar-thumb { background: #c5cae9; border-radius: 3px; }
+      `}</style>
     </div>
   );
 }

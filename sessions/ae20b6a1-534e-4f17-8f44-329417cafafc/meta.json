@@ -1,0 +1,18 @@
+{
+  "session_id": "ae20b6a1-534e-4f17-8f44-329417cafafc",
+  "user_name": "akshu",
+  "started_at": "2026-05-14T15:11:26.287428",
+  "ended_at": null,
+  "transcript": [
+    {
+      "speaker": "user",
+      "text": "In the name detection dot PY Matthew session dot PY now reads fresh column.",
+      "timestamp": "2026-05-14T15:11:38.683470"
+    },
+    {
+      "speaker": "kiosk",
+      "text": "RNS Institute of Technology",
+      "timestamp": "2026-05-14T15:11:39.742616"
+    }
+  ]
+}
