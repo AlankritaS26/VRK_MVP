@@ -1,33 +1,203 @@
-import psycopg2 #allowing language to send sql commands to server
+import psycopg2
 import os
 from dotenv import load_dotenv
 
-load_dotenv() #ensure script can see the database url stored in env file without typing password direcly into code
+load_dotenv()
 
-def get_db_connection(): #(helper function)instead of writing connection code everythime just call get_db
-    """Returns a connection to the PostgreSQL database."""
-    try: #if postgresql server is down,prevents system from crashing
+def get_db_connection():
+    try:
         conn = psycopg2.connect(os.getenv("DATABASE_URL"))
         return conn
     except Exception as e:
-        print(f" Database Connection Error: {e}")
+        print(f"Database Connection Error: {e}")
         return None
 
 def init_db():
-    """Sets up the table to log Kiosk interactions."""
     conn = get_db_connection()
     if conn:
-        cur = conn.cursor() #tells db where to execute the command
-        # Create a table for conversation logs - vital for your 'Proof of Work'
+        cur = conn.cursor()
         cur.execute('''
-            CREATE TABLE IF NOT EXISTS interactions ( 
+            CREATE TABLE IF NOT EXISTS interactions (
                 id SERIAL PRIMARY KEY,
+                session_id VARCHAR(50),
                 input_text TEXT,
                 response_text TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
-        ''') #if table is not there it builds it
-        conn.commit() #like hitting save,without it table wont be created on disk
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS faces (
+                id SERIAL PRIMARY KEY,
+                face_id VARCHAR(50) UNIQUE NOT NULL,
+                name VARCHAR(100) NOT NULL,
+                label_int INTEGER UNIQUE NOT NULL,
+                registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                visit_count INTEGER DEFAULT 1
+            );
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS sessions (
+                id SERIAL PRIMARY KEY,
+                session_id VARCHAR(50) UNIQUE NOT NULL,
+                face_id VARCHAR(50) REFERENCES faces(face_id) ON DELETE SET NULL,
+                user_name VARCHAR(100),
+                is_returning BOOLEAN DEFAULT FALSE,
+                visit_count INTEGER DEFAULT 1,
+                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                ended_at TIMESTAMP
+            );
+        ''')
+        conn.commit()
         cur.close()
         conn.close()
-        print("PostgreSQL: 'interactions' table is ready.")
+        print("PostgreSQL: all tables ready.")
+
+def get_all_faces():
+    conn = get_db_connection()
+    if not conn: return {}
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT label_int, face_id, name, registered_at, last_seen, visit_count FROM faces")
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        result = {}
+        for row in rows:
+            result[row[0]] = {
+                "face_id":     row[1],
+                "name":        row[2],
+                "registered":  str(row[3]),
+                "last_seen":   str(row[4]),
+                "visit_count": row[5]
+            }
+        return result
+    except Exception as e:
+        print(f"get_all_faces error: {e}")
+        return {}
+
+def save_face(label_int, face_id, name):
+    conn = get_db_connection()
+    if not conn: return
+    try:
+        cur = conn.cursor()
+        cur.execute('''
+            INSERT INTO faces (label_int, face_id, name)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (face_id) DO UPDATE
+            SET name = EXCLUDED.name, last_seen = CURRENT_TIMESTAMP
+        ''', (label_int, face_id, name))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"save_face error: {e}")
+
+def update_face_seen(face_id):
+    conn = get_db_connection()
+    if not conn: return
+    try:
+        cur = conn.cursor()
+        cur.execute('''
+            UPDATE faces
+            SET last_seen = CURRENT_TIMESTAMP, visit_count = visit_count + 1
+            WHERE face_id = %s
+        ''', (face_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"update_face_seen error: {e}")
+
+def get_face_by_id(face_id):
+    conn = get_db_connection()
+    if not conn: return None
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT face_id, name, label_int, visit_count FROM faces WHERE face_id = %s", (face_id,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if row:
+            return {"face_id": row[0], "name": row[1], "label_int": row[2], "visit_count": row[3]}
+        return None
+    except Exception as e:
+        print(f"get_face_by_id error: {e}")
+        return None
+
+def delete_face_by_name(name):
+    conn = get_db_connection()
+    if not conn: return False
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT face_id FROM faces WHERE LOWER(name) = LOWER(%s)", (name,))
+        rows = cur.fetchall()
+        if not rows:
+            cur.close()
+            conn.close()
+            return False
+        cur.execute("DELETE FROM faces WHERE LOWER(name) = LOWER(%s)", (name,))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return [r[0] for r in rows]
+    except Exception as e:
+        print(f"delete_face error: {e}")
+        return False
+
+def get_next_label_int():
+    conn = get_db_connection()
+    if not conn: return 0
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COALESCE(MAX(label_int), -1) + 1 FROM faces")
+        result = cur.fetchone()[0]
+        cur.close()
+        conn.close()
+        return result
+    except Exception as e:
+        print(f"get_next_label_int error: {e}")
+        return 0
+
+def save_session(session_id, face_id, user_name, is_returning, visit_count):
+    conn = get_db_connection()
+    if not conn: return
+    try:
+        cur = conn.cursor()
+        cur.execute('''
+            INSERT INTO sessions (session_id, face_id, user_name, is_returning, visit_count)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (session_id) DO NOTHING
+        ''', (session_id, face_id, user_name, is_returning, visit_count))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"save_session error: {e}")
+
+def end_session(session_id):
+    conn = get_db_connection()
+    if not conn: return
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE sessions SET ended_at = CURRENT_TIMESTAMP WHERE session_id = %s", (session_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"end_session error: {e}")
+
+def save_interaction(session_id, question, answer):
+    conn = get_db_connection()
+    if not conn: return
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO interactions (session_id, input_text, response_text) VALUES (%s, %s, %s)",
+            (session_id, question, answer)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"save_interaction error: {e}")

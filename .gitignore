@@ -1,15 +1,15 @@
-﻿venv/
-__pycache__/
-*.wav
-*.mp3
-*.onnx
-*.pyc
-test.py
-transcribe.py
-piper_test.py
-# --- Sneha's Backend Additions ---
 .env
-venv/
-.venv/
 __pycache__/
 *.pyc
+*.yml
+*.onnx
+*.onnx.json
+faces/
+sessions/
+face_labels.json
+face_db.json
+en_US-amy-low.onnx.json
+memory.py
+node_modules/
+frontend/node_modules/
+frontend/build/

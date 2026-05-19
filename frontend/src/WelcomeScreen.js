@@ -63,7 +63,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     recog.lang            = 'en-US';
     recog.continuous      = false;
     recog.interimResults  = true;
-    recog.maxAlternatives = 1;
+    recog.maxAlternatives = 3;
     recog.onstart = () => {
       isListening.current = true;
       lastTranscript.current = '';
@@ -89,8 +89,11 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     recog.onend = () => {
       isListening.current = false;
       if (isMounted.current) setListening(false);
-      const heard = lastTranscript.current.trim();
-      if (heard && !isSpeaking.current) sendToBackend(heard);
+      const heard = lastTranscript.current.trim().replace(/[.,!?]+$/, '').trim();
+      if (heard && heard.length >= 1 && !isSpeaking.current) {
+        console.log('[STT FINAL]', heard);
+        sendToBackend(heard);
+      }
       else if (!isSpeaking.current && isMounted.current) setTimeout(startListening, 400);
     };
     try { recog.start(); } catch(e) { console.error(e); }
@@ -102,6 +105,17 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     setLiveText('');
     const sid = session?.session_id || 'guest';
     addMessage(text, 'user');
+
+    // End session on goodbye words
+    const goodbyeWords = ['thank you', 'thanks', 'bye', 'goodbye', 'see you', 'ok bye', 'thank you so much'];
+    if (goodbyeWords.some(w => text.toLowerCase().includes(w))) {
+      addMessage('You are most welcome! Have a wonderful day. Goodbye!', 'kiosk');
+      speak('You are most welcome! Have a wonderful day. Goodbye!');
+      try {
+        await fetch(BACKEND + '/session/end?session_id=' + sid, { method: 'POST' });
+      } catch(e) {}
+      return;
+    }
     try {
       const [, askRes] = await Promise.all([
         fetch(BACKEND + '/message', {
