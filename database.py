@@ -201,3 +201,46 @@ def save_interaction(session_id, question, answer):
         conn.close()
     except Exception as e:
         print(f"save_interaction error: {e}")
+def save_face_image(face_id, image_index, image_bytes):
+    conn = get_db_connection()
+    if not conn: return
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO face_images (face_id, image_index, image_data) VALUES (%s, %s, %s)",
+            (face_id, image_index, psycopg2.Binary(image_bytes))
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"save_face_image error: {e}")
+
+def load_face_images(face_id):
+    conn = get_db_connection()
+    if not conn: return []
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT image_data FROM face_images WHERE face_id = %s ORDER BY image_index",
+            (face_id,)
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return [bytes(row[0]) for row in rows]
+    except Exception as e:
+        print(f"load_face_images error: {e}")
+        return []
+
+def delete_face_images(face_id):
+    conn = get_db_connection()
+    if not conn: return
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM face_images WHERE face_id = %s", (face_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"delete_face_images error: {e}")

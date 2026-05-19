@@ -1,35 +1,13 @@
-<<<<<<< HEAD
 .env
 __pycache__/
 *.pyc
-*.yml
-*.onnx
-*.onnx.json
+*.pyo
+face_model.yml
 faces/
 sessions/
 face_labels.json
 face_db.json
 en_US-amy-low.onnx.json
-memory.py
 node_modules/
 frontend/node_modules/
 frontend/build/
-=======
-﻿venv/
-__pycache__/
-*.wav
-*.mp3
-*.onnx
-*.pyc
-test.py
-transcribe.py
-piper_test.py
-# --- Sneha's Backend Additions ---
-.env
-venv/
-.venv/
-__pycache__/
-*.pyc
-faces/
-sessions/
->>>>>>> ec9f386edf06bd5d70bab9f9e9ff177684307ed1

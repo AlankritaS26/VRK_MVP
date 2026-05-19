@@ -3,7 +3,7 @@ import numpy as np
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
-from database import get_all_faces, save_face, update_face_seen, delete_face_by_name, get_next_label_int, init_db
+from database import get_all_faces, save_face, update_face_seen, delete_face_by_name, get_next_label_int, init_db, save_face_image, load_face_images, save_face_image, load_face_images
 
 load_dotenv()
 
@@ -14,7 +14,6 @@ WALK_AWAY_SEC = int(os.getenv('WALK_AWAY_SECONDS',   5))
 CAM_INDEX     = int(os.getenv('CAMERA_INDEX',        0))
 CONFIDENCE_MAX = 55.0
 
-FACES_DIR  = Path("faces"); FACES_DIR.mkdir(exist_ok=True)
 MODEL_PATH = Path("face_model.yml")
 
 face_cascade = cv2.CascadeClassifier(
@@ -25,10 +24,11 @@ recognizer = cv2.face.LBPHFaceRecognizer_create()
 def train_model(label_map):
     faces, labels = [], []
     for lid, info in label_map.items():
-        d = FACES_DIR / info["face_id"]
-        if not d.exists(): continue
-        for p in d.glob("*.jpg"):
-            img = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+        images = load_face_images(info["face_id"])
+        for img_bytes in images:
+            import numpy as np
+            nparr = np.frombuffer(img_bytes, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
             if img is not None:
                 faces.append(img); labels.append(lid)
     if faces:
@@ -41,7 +41,10 @@ def load_model(label_map):
         try:
             recognizer.read(str(MODEL_PATH))
             print(f"[MODEL] Loaded. Known: {[v['name'] for v in label_map.values()]}")
-        except: pass
+        except:
+            train_model(label_map)
+    elif label_map:
+        train_model(label_map)
 
 def post(endpoint, params=None, body=None):
     try:
@@ -83,8 +86,6 @@ def poll_name_response(timeout=60):
     return "Guest", False
 
 def capture_samples(cam, face_id):
-    person_dir = FACES_DIR / face_id
-    person_dir.mkdir(exist_ok=True)
     print("[CAPTURE] Capturing 30 face samples - please look at camera...")
     count = 0
     while count < 30:
@@ -94,14 +95,16 @@ def capture_samples(cam, face_id):
         faces = face_cascade.detectMultiScale(gray, 1.3, 5)
         for (x, y, w, h) in faces:
             roi = cv2.resize(gray[y:y+h, x:x+w], (200, 200))
-            cv2.imwrite(str(person_dir / f"{count:03d}.jpg"), roi)
+            _, buffer = cv2.imencode(".jpg", roi)
+            save_face_image(face_id, count, buffer.tobytes())
             count += 1
             cv2.rectangle(frame, (x,y), (x+w,y+h), (0,255,0), 2)
             cv2.putText(frame, f"Saving sample {count}/30", (x, y-10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
-        cv2.imshow('RNS Digital Receptionist', frame)
+        cv2.imshow("RNS Digital Receptionist", frame)
         cv2.waitKey(80)
-    print(f"[CAPTURE] Done - 30 samples saved.")
+    print("[CAPTURE] Done - 30 samples saved to PostgreSQL.")
+#OLD_CAPTURE_REPLACED
 
 def run():
     init_db()
