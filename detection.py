@@ -167,10 +167,11 @@ def run():
                             pid, conf = recognizer.predict(roi)
                             if conf < CONFIDENCE_MAX and pid in label_map:
                                 info = label_map[pid]
-                                name         = info["name"]
-                                visit_count  = info.get("visit_count", 1) + 1
-                                is_returning = True
-                                recognized   = True
+                                name             = info["name"]
+                                visit_count      = info.get("visit_count", 1) + 1
+                                is_returning     = True
+                                recognized       = True
+                                recognized_face_id = info["face_id"]
                                 update_face_seen(info["face_id"])
                                 label_map[pid]["visit_count"] = visit_count
                                 label_map[pid]["last_seen"]   = datetime.now().isoformat()
@@ -187,8 +188,10 @@ def run():
                                 f"{name}_{datetime.now().isoformat()}".encode()
                             ).hexdigest()[:12]
                             label_id = get_next_label_int()
-                            capture_samples(cam, face_id)
+                            # Save face to DB FIRST before capturing images
+                            # so foreign key constraint is satisfied
                             save_face(label_id, face_id, name)
+                            capture_samples(cam, face_id)
                             label_map[label_id] = {
                                 "face_id":     face_id,
                                 "name":        name,
@@ -201,7 +204,12 @@ def run():
                         else:
                             print(f"[GUEST] '{name}' chose not to save.")
 
-                    current_face_id = info['face_id'] if recognized else face_id if save_to_db and name != 'Guest' else ''
+                    if recognized:
+                        current_face_id = recognized_face_id
+                    elif save_to_db and name != "Guest":
+                        current_face_id = face_id
+                    else:
+                        current_face_id = ""
                     sid = start_session(name, is_returning, visit_count, current_face_id)
                     if sid:
                         current_session = sid

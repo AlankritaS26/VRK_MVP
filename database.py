@@ -164,14 +164,17 @@ def save_session(session_id, face_id, user_name, is_returning, visit_count):
     if not conn: return
     try:
         cur = conn.cursor()
+        # Use None instead of empty string for face_id to avoid FK constraint failure
+        fid = face_id if face_id and face_id.strip() else None
         cur.execute('''
             INSERT INTO sessions (session_id, face_id, user_name, is_returning, visit_count)
             VALUES (%s, %s, %s, %s, %s)
             ON CONFLICT (session_id) DO NOTHING
-        ''', (session_id, face_id, user_name, is_returning, visit_count))
+        ''', (session_id, fid, user_name, is_returning, visit_count))
         conn.commit()
         cur.close()
         conn.close()
+        print(f"[DB] Session saved: {session_id} user={user_name}")
     except Exception as e:
         print(f"save_session error: {e}")
 
