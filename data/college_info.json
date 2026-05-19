@@ -1,0 +1,120 @@
+{
+  "college": {
+    "name": "RNS Institute of Technology",
+    "established": 2000,
+    "type": "Autonomous",
+    "location": "Channasandra, Dr. Vishnuvardhan Road, Bengaluru - 560098",
+    "website": "https://www.rnsit.ac.in",
+    "phone": "080-23180000",
+    "email": "principal@rnsit.ac.in"
+  },
+  "administration": {
+    "principal": {"name": "Dr. K N Subramanya", "qualification": "Ph.D"},
+    "director": {"name": "Dr. R Narayana Swamy"}
+  },
+  "facilities": {
+    "library": {
+      "name": "RNSIT Central Library",
+      "timings": "09:00 AM to 08:00 PM",
+      "location": "Opposite the Administrative Block",
+      "platform": "K-NIMBUS"
+    },
+    "canteen": {
+      "location": "Near the sports ground and hostel entrance"
+    },
+    "auditorium": {
+      "name": "Dr. Shivaram Karanth Auditorium",
+      "location": "Administrative Block",
+      "seating_capacity": 1800
+    },
+    "gym": {
+      "available": true,
+      "details": "Separate gym facilities for boys and girls"
+    },
+    "hostel": {
+      "boys": {"capacity": 530},
+      "girls": {"capacity": 300}
+    },
+    "placement_cell": {
+      "location": "Ground floor of Admin Block"
+    },
+    "transport": {
+      "details": "College bus facility available for students"
+    },
+    "medical": {
+      "details": "Medical help available on campus"
+    },
+    "wifi": {
+      "details": "High speed Wi-Fi available across campus"
+    },
+    "atm": {
+      "details": "ATM facility available on campus"
+    },
+    "toyota_center": {
+      "name": "Toyota Center of Excellence",
+      "details": "Industry collaboration center available on campus"
+    }
+  },
+  "departments": {
+    "cse": {"floor": "3rd floor", "hod": "Dr. Sridhar", "intake": 180},
+    "ise": {"floor": "2nd floor", "hod": "Dr. Manjunath", "intake": 120},
+    "ece": {"floor": "4th floor", "hod": "Dr. Rekha", "intake": 120},
+    "eee": {"floor": "2nd floor", "hod": "Dr. Usha", "intake": 60},
+    "me": {"floor": "Ground floor", "hod": "Dr. Ravi", "intake": 120},
+    "civil": {"floor": "1st floor", "hod": "Dr. Suresh", "intake": 60},
+    "mba": {"floor": "Admin Block", "hod": "Dr. Anitha", "intake": 60},
+    "mca": {"floor": "3rd floor", "hod": "Dr. Prakash", "intake": 60}
+  },
+  "admissions": {
+    "cet_code": "E088",
+    "comedk_code": "E088",
+    "contact": "admissions@rnsit.ac.in"
+  },
+  "placements": {
+    "highest_package": "44 LPA",
+    "companies_count": "150+",
+    "details": "Top companies like Amazon, Microsoft, Infosys, Wipro recruit from RNSIT"
+  },
+  "academics": {
+    "phd": true,
+    "working_hours": "8:30 AM to 5:30 PM",
+    "clubs": "IEEE, CSI, Robotics Club, Cultural Club, Sports Club, NSS"
+  },
+  "faqs": [
+    {"question": "Hello", "answer": "Hello! Welcome to RNS Institute of Technology. I am your digital receptionist. How may I assist you today?"},
+    {"question": "Hi", "answer": "Hi there! Welcome to RNSIT. How can I help you today?"},
+    {"question": "Hey", "answer": "Hey! Welcome to RNS Institute of Technology. What can I help you with?"},
+    {"question": "Good morning", "answer": "Good morning! Welcome to RNSIT. How may I assist you today?"},
+    {"question": "Good afternoon", "answer": "Good afternoon! Welcome to RNSIT. How may I help you?"},
+    {"question": "Thank you", "answer": "You are most welcome! It was my pleasure to assist you. Have a wonderful day at RNSIT!"},
+    {"question": "Thanks", "answer": "You are welcome! Feel free to ask if you need anything else. Have a great day!"},
+    {"question": "Bye", "answer": "Goodbye! Thank you for visiting RNSIT. Have a wonderful day!"},
+    {"question": "Goodbye", "answer": "Goodbye! It was nice helping you. Have a great day at RNSIT!"},
+    {"question": "What can you do", "answer": "I can help you with information about RNSIT departments, facilities, staff, admissions, placements, library, hostel, canteen, and much more. Just ask me anything!"},
+    {"question": "Who is the Principal of RNSIT?", "answer": "The Principal of RNSIT is Dr. K N Subramanya."},
+    {"question": "Who is the Director of RNSIT?", "answer": "The Director of RNSIT is Dr. R Narayana Swamy."},
+    {"question": "When was RNSIT established?", "answer": "RNSIT was established in the year 2000."},
+    {"question": "Who founded RNSIT?", "answer": "RNSIT was founded by Dr. R Narayana Swamy."},
+    {"question": "Where is the Accounts Manager office?", "answer": "The Accounts Manager office is located in the Administrative Block."},
+    {"question": "What is the highest placement package offered?", "answer": "The highest placement package offered at RNSIT is 44 LPA."},
+    {"question": "How can I contact the Admissions department?", "answer": "You can contact the Admissions department at admissions@rnsit.ac.in or visit the Admin Block."},
+    {"question": "Is there a gym on campus?", "answer": "Yes, RNSIT has separate gym facilities for boys and girls."},
+    {"question": "Where is the canteen located?", "answer": "The canteen is located near the sports ground and hostel entrance."},
+    {"question": "What are the college working hours?", "answer": "The college working hours are 8:30 AM to 5:30 PM."},
+    {"question": "Does RNSIT have Wi-Fi?", "answer": "Yes, RNSIT has high speed Wi-Fi available across the entire campus."},
+    {"question": "Where is the Dr. Shivaram Karanth Auditorium?", "answer": "The Dr. Shivaram Karanth Auditorium is located in the Administrative Block with a seating capacity of 1800."},
+    {"question": "What is the intake for the CSE department?", "answer": "The CSE department has an annual intake of 180 students."},
+    {"question": "Is there an ATM on campus?", "answer": "Yes, there is an ATM facility available on the RNSIT campus."},
+    {"question": "Where can I find the Toyota Center of Excellence?", "answer": "The Toyota Center of Excellence is an industry collaboration center available on the RNSIT campus."},
+    {"question": "What are the library timings?", "answer": "The library is open from 9:00 AM to 8:00 PM."},
+    {"question": "Does the college provide transport?", "answer": "Yes, RNSIT provides college bus facility for students."},
+    {"question": "Where is the placement cell?", "answer": "The placement cell is located on the ground floor of the Admin Block."},
+    {"question": "How many students can the girls hostel accommodate?", "answer": "The girls hostel can accommodate 300 students."},
+    {"question": "Is medical help available on campus?", "answer": "Yes, medical help is available on the RNSIT campus."},
+    {"question": "What is the COMEDK code for RNSIT?", "answer": "The COMEDK code for RNSIT is E088."},
+    {"question": "What is the CET code for RNSIT?", "answer": "The CET code for RNSIT is E088."},
+    {"question": "How many companies recruit from RNSIT?", "answer": "More than 150 companies recruit from RNSIT including Amazon, Microsoft, Infosys and Wipro."},
+    {"question": "Does RNSIT have PhD programs?", "answer": "Yes, RNSIT offers PhD programs."},
+    {"question": "What are the student clubs at RNSIT?", "answer": "RNSIT has clubs including IEEE, CSI, Robotics Club, Cultural Club, Sports Club and NSS."}
+  ]
+}

@@ -24,8 +24,7 @@ app = FastAPI(title="RNSIT Digital Receptionist")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_origin_regex=".*",
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -160,7 +159,8 @@ async def post_message(payload: MessagePayload):
 # ─────────────────────────────────────────────
 @app.get("/ask")
 def ask_kiosk(question: str = Query(..., description="Visitor question")):
-    with open("data/college_info.json", encoding="utf-8") as f:
+    BASE_DIR = Path(__file__).parent
+    with open(BASE_DIR / "data" / "college_info.json", encoding="utf-8") as f:
         data = json.load(f)
 
     q = question.lower().strip()
