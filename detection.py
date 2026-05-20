@@ -59,12 +59,13 @@ def get(endpoint):
         return requests.get(f'{BACKEND}{endpoint}', timeout=3).json()
     except: return None
 
-def start_session(name, is_returning, visit_count, face_id=''):
+def start_session(name, is_returning, visit_count, face_id='', session_id=None):
     r = post('/session/start', params={
         'trigger': 'camera', 'user_name': name,
         'is_returning': str(is_returning).lower(),
         'visit_count': visit_count,
-        'face_id': face_id
+        'face_id': face_id,
+        'session_id': session_id or ''
     })
     return r.get('session_id') if r else None
 
@@ -210,7 +211,8 @@ def run():
                         current_face_id = face_id
                     else:
                         current_face_id = ""
-                    sid = start_session(name, is_returning, visit_count, current_face_id)
+                    # Use face_id as session_id so same person always has same session
+                    sid = start_session(name, is_returning, visit_count, current_face_id, session_id=current_face_id if current_face_id else None)
                     if sid:
                         current_session = sid
                         session_active  = True

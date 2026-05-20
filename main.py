@@ -84,12 +84,14 @@ async def start_session(
     user_name: str = "Guest",
     is_returning: bool = False,
     visit_count: int = 1,
-    face_id: str = ""
+    face_id: str = "",
+    session_id: str = ""
 ):
     global active_session, message_log
-    session_id = str(uuid.uuid4())
+    # Use face_id as session_id if provided so same person always has same session
+    final_session_id = face_id if face_id else (session_id if session_id else str(uuid.uuid4()))
     active_session = {
-        "session_id":   session_id,
+        "session_id":   final_session_id,
         "user_name":    user_name,
         "is_returning": is_returning,
         "visit_count":  visit_count,
@@ -98,9 +100,9 @@ async def start_session(
     }
     message_log = []
 
-    # Save to PostgreSQL
+    # Save to PostgreSQL - update if exists, insert if new
     save_session(
-        session_id,
+        final_session_id,
         face_id if face_id else None,
         user_name,
         is_returning,
@@ -108,7 +110,7 @@ async def start_session(
     )
 
     await manager.broadcast({"type": "session_start", "session": active_session})
-    return {"status": "success", "session_id": session_id, "session": active_session}
+    return {"status": "success", "session_id": final_session_id, "session": active_session}
 
 
 @app.post("/session/end")

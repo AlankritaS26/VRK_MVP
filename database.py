@@ -169,12 +169,16 @@ def save_session(session_id, face_id, user_name, is_returning, visit_count):
         cur.execute('''
             INSERT INTO sessions (session_id, face_id, user_name, is_returning, visit_count)
             VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (session_id) DO NOTHING
+            ON CONFLICT (session_id) DO UPDATE
+            SET visit_count = EXCLUDED.visit_count,
+                is_returning = EXCLUDED.is_returning,
+                user_name = EXCLUDED.user_name,
+                ended_at = NULL
         ''', (session_id, fid, user_name, is_returning, visit_count))
         conn.commit()
         cur.close()
         conn.close()
-        print(f"[DB] Session saved: {session_id} user={user_name}")
+        print(f"[DB] Session saved/updated: {session_id} user={user_name}")
     except Exception as e:
         print(f"save_session error: {e}")
 
