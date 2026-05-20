@@ -248,6 +248,53 @@ def ask_kiosk(question: str = Query(..., description="Visitor question")):
     data = COLLEGE_DATA_CACHE or {}
 
     q = question.lower().strip()
+    sid = active_session["session_id"] if active_session else "unknown"
+    from backend.database import get_admission_fee_by_branch, get_admission_requirements
+
+    # 1. Handle Fee and Installment Questions
+    if any(kw in q for kw in ["fee", "fees", "cost", "price", "instalment", "payment"]):
+        branch_keyword = None
+        for b in ["cse", "ai", "data", "cyber", "ece", "vlsi", "eee", "mech", "civil"]:
+            if b in q:
+                branch_keyword = b
+                break
+        
+        if branch_keyword:
+            fee_data = get_admission_fee_by_branch(branch_keyword)
+            if fee_data:
+                name, annual, inst1, inst2 = fee_data
+                if inst2 == 0:
+                    answer = f"The annual management quota fee for {name} is ₹{annual:,.2f}. Note that for this branch, it must be paid as a single installment at the time of admission."
+                else:
+                    answer = f"The annual management fee for {name} is ₹{annual:,.2f}. Parents can split this payment into two parts: ₹{inst1:,.2f} due at admission, and ₹{inst2:,.2f} paid via post-dated cheques over 3 months."
+            else:
+                answer = "I couldn't find the exact fee mapping for that stream. Management fees at RNSIT range from ₹1,10,000 up to ₹7,50,000 per year depending on the branch. Which specific branch are you looking for?"
+        else:
+            answer = "Management quota fees range from ₹1,10,000 (Civil) up to ₹7,50,000 per year (Core CSE). If you name a specific engineering branch, I can give you its exact annual cost and installment structure!"
+        
+        try:
+            save_interaction(question, answer)
+        except Exception as exc:
+            logger.exception("Admissions fee DB log failed: %s", exc)
+        return {"question": question, "answer": answer}
+
+    # 2. Handle Paperwork and Verification Documents
+    if any(kw in q for kw in ["document", "documents", "certificate", "paperwork", "bring", "marks card"]):
+        quota = "KCET" if any(k in q for k in ["cet", "kea", "govt"]) else "Management"
+        docs = get_admission_requirements(quota)
+        
+        if docs:
+            # Safely unpack database positional tuple records (doc_name, count)
+            doc_list = "\n".join([f"- {d} ({d} copies)" for d in docs])
+            answer = f"For {quota} Quota admissions, you must bring the following original files along with photocopies:\n{doc_list}"
+        else:
+            answer = "Please bring your 10th and 12th Marks Cards, Transfer Certificate, Entrance Exam Rank Card, and ID card copies to the Admin Block window."
+        
+        try:
+            save_interaction(question, answer)
+        except Exception as exc:
+            logger.exception("Requirements documentation DB log failed: %s", exc)
+        return {"question": question, "answer": answer}
 
     # ignore these common words when matching
     stop_words = {

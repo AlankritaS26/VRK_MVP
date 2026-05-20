@@ -251,3 +251,42 @@ def delete_face_images(face_id):
         conn.close()
     except Exception as e:
         print(f"delete_face_images error: {e}")
+        
+def get_admission_fee_by_branch(search_term: str):
+    """Searches the management fees table for a specific branch matching keywords."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        # Using ILIKE for case-insensitive partial matching
+        query = """
+            SELECT branch_full_name, annual_fee, instalment_1, instalment_2 
+            FROM public.management_program_fees 
+            WHERE LOWER(branch_full_name) LIKE %s OR LOWER(branch_code) LIKE %s;
+        """
+        cursor.execute(query, (f"%{search_term}%", f"%{search_term}%"))
+        return cursor.fetchone() # Returns a single row if found
+    except Exception as e:
+        print(f"Error querying management fees: {e}")
+        return None
+    finally:
+        cursor.close()
+        conn.close()
+
+def get_admission_requirements(quota_type: str):
+    """Fetches all mandatory documents required for a specific entry quota."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        query = """
+            SELECT document_name, copies_required 
+            FROM public.admission_requirements 
+            WHERE LOWER(quota_type) = LOWER(%s);
+        """
+        cursor.execute(query, (quota_type,))
+        return cursor.fetchall() # Returns list of document tuples
+    except Exception as e:
+        print(f"Error querying requirements: {e}")
+        return []
+    finally:
+        cursor.close()
+        conn.close()
