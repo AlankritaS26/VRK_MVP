@@ -6,81 +6,90 @@ HOW TO RUN (always from VRK_MVP/ folder, not from inside backend/):
 """
 
 import os
-import json
 import uuid
 import shutil
 import logging
+import hashlib
 from pathlib import Path
-import sys
 from datetime import datetime
-from typing import Dict, List, Optional, Any
+from typing import List
+import sys
 
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect, status
+import redis
+from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 from dotenv import load_dotenv
 
-# add project root to path so "from backend.xxx import" works
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from backend.database import (
-    get_db_connection, init_db,
+    init_db,
     save_session, end_session, save_interaction,
     delete_face_by_name,
-    get_admission_fee_by_branch, get_admission_requirements
+    get_admission_fee_by_branch, get_admission_requirements,
 )
-
-# Import your local RAG service components
 from backend.llm import initialize_rag_knowledge_base, generate_rag_kiosk_response
 
 load_dotenv()
 
-# basic logging setup
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
-logger = logging.getLogger("RNSIT_Receptionist")
+logger = logging.getLogger("RNSIT_Kiosk")
 
 ALLOWED_ORIGINS: List[str] = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 MAX_QUERY_LENGTH: int = 500
 
-# create the app
 app = FastAPI(title="RNSIT Digital Receptionist")
 
-# allow frontend to talk to this server
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True if ALLOWED_ORIGINS != ["*"] else False,
+    allow_credentials=ALLOWED_ORIGINS != ["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Set up SQL database tables on startup execution
-init_db()
+# Redis / Memurai cache
+try:
+    redis_client = redis.Redis(host="localhost", port=6379, decode_responses=True)
+    redis_client.ping()
+    logger.info("[REDIS] Connected to Memurai caching engine.")
+except Exception as e:
+    logger.warning("[REDIS] Memurai unreachable: %s", e)
+    redis_client = None
 
-# --- ASYNCHRONOUS ENGINE STARTUP HOOK ---
-@app.on_event("startup")
-async def startup_event():
-    logger.info("[SYSTEM] Booting server core infrastructure...")
-    try:
-        # Pre-process the JSON files and generate structural vector dimensions instantly
-        await initialize_rag_knowledge_base()
-        logger.info("[SYSTEM] Local RAG Vector Cache matrix fully established.")
-    except Exception as e:
-        logger.error(f"[SYSTEM] Startup RAG caching vector routine failed: {e}")
-
-# --- in-memory state for the current visitor ---
+# In-memory state
 active_session: dict | None = None
 message_log: list[dict] = []
 visitor_name_response: dict = {"ready": False, "name": "", "save": True}
 
-# --- websocket manager ---
+init_db()
+
+
+# ==========================================
+# STARTUP
+# ==========================================
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info("[SYSTEM] Booting server...")
+    try:
+        await initialize_rag_knowledge_base()
+        logger.info("[SYSTEM] RAG vector cache loaded.")
+    except Exception as e:
+        logger.error("[SYSTEM] RAG startup failed: %s", e)
+
+
+# ==========================================
+# WEBSOCKET
+# ==========================================
+
 class ConnectionManager:
-    """Keeps track of all open websocket connections and sends them messages."""
     def __init__(self):
         self.active: list[WebSocket] = []
 
@@ -98,7 +107,9 @@ class ConnectionManager:
             except Exception:
                 self.active.remove(ws)
 
+
 manager = ConnectionManager()
+
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
@@ -109,12 +120,35 @@ async def websocket_endpoint(ws: WebSocket):
     except WebSocketDisconnect:
         manager.disconnect(ws)
 
-# --- health check ---
+
+# ==========================================
+# HELPERS
+# ==========================================
+
+def _log_message(text: str, speaker: str) -> dict:
+    """Append a message to the in-memory log and return the entry."""
+    entry = {
+        "index":     len(message_log),
+        "text":      text,
+        "speaker":   speaker,
+        "timestamp": datetime.now().strftime("%H:%M:%S"),
+    }
+    message_log.append(entry)
+    return entry
+
+
+# ==========================================
+# HEALTH CHECK
+# ==========================================
+
 @app.get("/")
 def root():
     return {"status": "RNSIT Kiosk Backend is Live"}
 
-# --- session endpoints ---
+
+# ==========================================
+# SESSION ENDPOINTS
+# ==========================================
 
 @app.post("/session/start")
 async def start_session(
@@ -134,6 +168,7 @@ async def start_session(
         "is_returning": is_returning,
         "visit_count":  visit_count,
         "face_id":      face_id,
+        "trigger":      trigger,
         "asking_name":  False,
     }
     message_log = []
@@ -150,7 +185,6 @@ async def end_session_endpoint(session_id: str = None):
     if sid:
         end_session(sid)
     active_session = None
-
     await manager.broadcast({"type": "session_end", "session_id": sid})
     return {"status": "success"}
 
@@ -168,7 +202,9 @@ def get_session_messages(session_id: str, after: int = 0):
     return {"messages": msgs}
 
 
-# --- message endpoint ---
+# ==========================================
+# MESSAGE ENDPOINT
+# ==========================================
 
 class MessagePayload(BaseModel):
     session_id: str = Field(..., description="Session identifier")
@@ -177,124 +213,123 @@ class MessagePayload(BaseModel):
 
     @field_validator("text")
     @classmethod
-    def _strip_text(cls, v: str) -> str:
-        return v.strip()
-
-    @field_validator("text")
-    @classmethod
-    def _limit_length(cls, v: str) -> str:
+    def _validate_text(cls, v: str) -> str:
+        v = v.strip()
         return v[:MAX_QUERY_LENGTH] if len(v) > MAX_QUERY_LENGTH else v
 
 
 @app.post("/message")
 async def post_message(payload: MessagePayload):
-    entry = {
-        "index":     len(message_log),
-        "text":      payload.text,
-        "speaker":   payload.speaker,
-        "timestamp": datetime.now().strftime("%H:%M:%S"),
-    }
-    message_log.append(entry)
+    entry = _log_message(payload.text, payload.speaker)
     await manager.broadcast({"type": "message", **entry})
     return {"status": "ok"}
 
 
-# --- Smart Core Ask / FAQ Router Endpoint ---
+# ==========================================
+# ASK ENDPOINT
+# ==========================================
 
 @app.get("/ask")
 async def ask_kiosk(question: str = Query(..., description="Visitor question")):
-    """
-    Tiered Production Routing Engine:
-    Tier 1: Deterministic SQL Lookups (Fees, Admission Verification paperwork)
-    Tier 2: High-Speed Text Intercept Fallbacks (Short conversational phrases)
-    Tier 3: Contextual Local RAG Pipeline (Ollama + Llama 3.1 Neural Search Engine)
-    """
     q = question.lower().strip()
     sid = active_session["session_id"] if active_session else "unknown"
+    visitor_name = (active_session.get("user_name") or "there") if active_session else "there"
 
-    # -------------------------------------------------------------------------
-    # TIER 1: DETERMINISTIC SQL CHECKS (Fees & Certificate Requirements)
-    # -------------------------------------------------------------------------
+    # Log visitor question to session history and broadcast to WS clients
+    visitor_entry = _log_message(question, "visitor")
+    await manager.broadcast({"type": "message", **visitor_entry})
+
+    async def _respond(answer: str, source: str = "") -> dict:
+        """Save to DB, log to session history, broadcast, and return response."""
+        try:
+            save_interaction(sid, question, answer)
+        except Exception as exc:
+            logger.exception("DB interaction log failed: %s", exc)
+        kiosk_entry = _log_message(answer, "kiosk")
+        await manager.broadcast({"type": "message", **kiosk_entry})
+        result = {"question": question, "answer": answer}
+        if source:
+            result["source"] = source
+        return result
+
+    # --- TIER 1: SQL — Fees ---
     if any(kw in q for kw in ["fee", "fees", "cost", "price", "instalment", "payment"]):
-        branch_keyword = None
-        for b in ["cse", "ai", "data", "cyber", "ece", "vlsi", "eee", "mech", "civil"]:
-            if b in q:
-                branch_keyword = b
-                break
-        
+        branch_keyword = next(
+            (b for b in ["cse", "ai", "data", "cyber", "ece", "vlsi", "eee", "mech", "civil"] if b in q),
+            None,
+        )
         if branch_keyword:
             fee_data = get_admission_fee_by_branch(branch_keyword)
             if fee_data:
                 name, annual, inst1, inst2 = fee_data
                 if inst2 == 0:
-                    answer = f"The annual management quota fee for {name} is ₹{annual:,.2f}. Note that for this branch, it must be paid as a single installment at the time of admission."
+                    answer = (
+                        f"The annual management quota fee for {name} is ₹{annual:,.2f}. "
+                        "It must be paid as a single installment at the time of admission."
+                    )
                 else:
-                    answer = f"The annual management fee for {name} is ₹{annual:,.2f}. Parents can split this payment into two parts: ₹{inst1:,.2f} due at admission, and ₹{inst2:,.2f} paid via post-dated cheques over 3 months."
+                    answer = (
+                        f"The annual management fee for {name} is ₹{annual:,.2f}. "
+                        f"Split into ₹{inst1:,.2f} at admission and ₹{inst2:,.2f} via post-dated cheques over 3 months."
+                    )
             else:
-                answer = "I couldn't find the exact fee mapping for that stream. Management fees at RNSIT range from ₹1,10,000 up to ₹7,50,000 per year depending on the branch. Which specific branch are you looking for?"
+                answer = "I couldn't find the exact fee for that stream. Management fees range from ₹1,10,000 to ₹7,50,000/year. Which branch are you asking about?"
         else:
-            answer = "Management quota fees range from ₹1,10,000 (Civil) up to ₹7,50,000 per year (Core CSE). If you name a specific engineering branch, I can give you its exact annual cost and installment structure!"
-        
-        try:
-            save_interaction(sid, question, answer)  # Fixed parameter bug
-        except Exception as exc:
-            logger.exception("Admissions fee DB log failed: %s", exc)
-        return {"question": question, "answer": answer}
+            answer = "Management fees range from ₹1,10,000 (Civil) to ₹7,50,000/year (Core CSE). Name a specific branch for exact figures!"
 
+        return await _respond(answer)
+
+    # --- TIER 1: SQL — Documents ---
     if any(kw in q for kw in ["document", "documents", "certificate", "paperwork", "bring", "marks card"]):
         quota = "KCET" if any(k in q for k in ["cet", "kea", "govt"]) else "Management"
         docs = get_admission_requirements(quota)
-        
         if docs:
-            # Unpacking table positional tuples (document_name, copy_count) securely
-            doc_list = "\n".join([f"- {doc} ({doc} copies)" for doc in docs])
-            answer = f"For {quota} Quota admissions, you must bring the following original files along with photocopies:\n{doc_list}"
+            doc_list = "\n".join(f"- {doc}" for doc in docs)
+            answer = f"For {quota} Quota admissions, bring originals and photocopies of:\n{doc_list}"
         else:
-            answer = "Please bring your 10th and 12th Marks Cards, Transfer Certificate, Entrance Exam Rank Card, and ID card copies to the Admin Block window."
-        
-        try:
-            save_interaction(sid, question, answer)  # Fixed parameter bug
-        except Exception as exc:
-            logger.exception("Requirements documentation DB log failed: %s", exc)
-        return {"question": question, "answer": answer}
+            answer = "Please bring your 10th and 12th Marks Cards, Transfer Certificate, Entrance Exam Rank Card, and ID copies to the Admin Block."
 
-    # -------------------------------------------------------------------------
-    # TIER 2: STATIC HIGH-SPEED TEXT INTERCEPTS
-    # -------------------------------------------------------------------------
+        return await _respond(answer)
+
+    # --- TIER 2: Static intercepts ---
     short_greetings = {
-        "hi":  "Hi there! Welcome to RNSIT. How can I help you today?",
+        "hi":  f"Hi {visitor_name}! Welcome to RNSIT. How can I help you today?",
+        "hey": f"Hey {visitor_name}! Welcome to RNS Institute of Technology. What can I help with?",
         "ok":  "Alright! Let me know if you need any further assistance.",
-        "hey": "Hey! Welcome to RNS Institute of Technology. What can I help with?",
     }
     if q in short_greetings:
-        answer = short_greetings[q]
+        return await _respond(short_greetings[q])
+
+    # --- PERFORMANCE LAYER: Redis cache ---
+    cache_key = f"kiosk:cache:{hashlib.md5(q.encode()).hexdigest()}"
+    if redis_client:
         try:
-            save_interaction(sid, question, answer)
-        except Exception as exc:
-            logger.exception("Greeting intercept DB log failed: %s", exc)
-        return {"question": question, "answer": answer}
+            cached = redis_client.get(cache_key)
+            if cached:
+                logger.info("[REDIS HIT] '%s'", question)
+                return await _respond(cached, source="redis_cache")
+        except Exception as e:
+            logger.warning("Redis read error: %s", e)
 
-    # -------------------------------------------------------------------------
-    # TIER 3: CONTEXT-INJECTED LOCAL SEMANTIC RAG INFERENCE (Llama 3.1)
-    # -------------------------------------------------------------------------
+    # --- TIER 3: RAG / Llama 3.1 ---
+    logger.info("[CACHE MISS] Running RAG for: '%s'", question)
     try:
-        # Pass the current question and the last 6 messages (3 full conversational turns)
-        recent_history = message_log[-6:] if message_log else []
-        answer = await generate_rag_kiosk_response(question, history=recent_history)
-        
+        answer = await generate_rag_kiosk_response(question, history=message_log[:-1][-6:])
+        if redis_client and answer:
+            try:
+                redis_client.set(cache_key, answer, ex=3600)
+            except Exception as e:
+                logger.warning("Redis write error: %s", e)
     except Exception as exc:
-        logger.error(f"Semantic Local AI matching operation failed: {exc}")
-        answer = "I am sorry, I am currently having trouble processing that query. Please visit the Admin Block for assistance."
-    # save this question+answer interaction to the database
-    try:
-        save_interaction(sid, question, answer)
-    except Exception as exc:
-        logger.exception("DB interaction log failed: %s", exc)
+        logger.error("RAG inference failed: %s", exc)
+        answer = "I'm having trouble processing that. Please visit the Admin Block for assistance."
 
-    return {"question": question, "answer": answer}
+    return await _respond(answer, source="local_llm")
 
 
-# --- visitor name flow ---
+# ==========================================
+# VISITOR ENDPOINTS
+# ==========================================
 
 @app.post("/visitor/unknown")
 async def visitor_unknown():
@@ -308,6 +343,7 @@ async def visitor_unknown():
             "is_returning": False,
             "visit_count":  1,
             "face_id":      "",
+            "trigger":      "camera",
             "asking_name":  True,
         }
     else:
@@ -322,7 +358,7 @@ async def submit_name(name: str = "Guest", save: bool = True):
     visitor_name_response = {"ready": True, "name": name, "save": save}
     if active_session:
         active_session["asking_name"] = False
-
+        active_session["user_name"] = name
     return {"status": "ok"}
 
 
@@ -344,22 +380,21 @@ async def delete_my_data(name: str):
         face_ids = delete_face_by_name(name)
         if not face_ids:
             return {"success": False, "message": f"No data found for {name}."}
-
         for face_id in face_ids:
             face_dir = PROJECT_ROOT / "faces" / face_id
             if face_dir.exists():
                 shutil.rmtree(face_dir)
-
         model_path = PROJECT_ROOT / "face_model.yml"
         if model_path.exists():
             model_path.unlink()
-
         return {"success": True, "message": f"Data for {name} deleted successfully."}
     except Exception as exc:
         return {"success": False, "message": str(exc)}
 
 
-# --- face registration ---
+# ==========================================
+# FACE REGISTRATION
+# ==========================================
 
 class RegisterFacePayload(BaseModel):
     face_id: str = Field(..., description="Unique face id")

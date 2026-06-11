@@ -1,32 +1,34 @@
 import os
 import json
 import math
+import asyncio
+import logging
 import httpx
 from fastapi import HTTPException
+
+logger = logging.getLogger(__name__)
 
 # ==========================================
 # CONFIGURATION & GLOBAL VECTOR CACHE
 # ==========================================
 OLLAMA_BASE_URL = "http://localhost:11434"
-GENERATE_MODEL = "llama3.1"
+GENERATE_MODEL = "llama3.1:latest"
 EMBED_MODEL = "nomic-embed-text"
+SIMILARITY_THRESHOLD = 0.42
 
-# This assumes your structure is: project_root/backend/app/services/llm.py
-# Moving up 3 levels lands at the project root where the 'data' folder lives.
+# This file lives at: project_root/backend/app/services/llm.py
 JSON_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "college_info.json")
 
-# Global arrays to cache text chunks and their matching embeddings in memory
-KNOWLEDGE_CHUNKS = []
-KNOWLEDGE_EMBEDDINGS = []
+# In-memory cache: parallel arrays of text chunks and their embedding vectors
+KNOWLEDGE_CHUNKS: list[str] = []
+KNOWLEDGE_EMBEDDINGS: list[list[float]] = []
+
 
 # ==========================================
-# 1. LOCAL OLLAMA EMBEDDING API
+# OLLAMA EMBEDDING API
 # ==========================================
 async def get_embedding(text: str) -> list[float]:
-    """
-    Calls Ollama's local embedding engine to turn a text string 
-    into a 768-dimensional vector coordinate list.
-    """
+    """Calls Ollama's local embedding engine and returns a 768-dim vector."""
     url = f"{OLLAMA_BASE_URL}/api/embeddings"
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
@@ -34,16 +36,14 @@ async def get_embedding(text: str) -> list[float]:
             response.raise_for_status()
             return response.json().get("embedding", [])
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Ollama Embedding compilation failed: {e}")
+            raise HTTPException(status_code=500, detail=f"Ollama embedding failed: {e}")
+
 
 # ==========================================
-# 2. MATHEMATICAL COSINE SIMILARITY
+# COSINE SIMILARITY
 # ==========================================
 def cosine_similarity(vec1: list[float], vec2: list[float]) -> float:
-    """
-    Calculates the mathematical cosine similarity score between two vector arrays.
-    Returns a float value between 0 (completely different) and 1 (exact semantic match).
-    """
+    """Returns a float representing semantic similarity between two vectors."""
     if not vec1 or not vec2:
         return 0.0
     dot_product = sum(a * b for a, b in zip(vec1, vec2))
@@ -53,145 +53,156 @@ def cosine_similarity(vec1: list[float], vec2: list[float]) -> float:
         return 0.0
     return dot_product / (norm_a * norm_b)
 
+
 # ==========================================
-# 3. DATA EXTRACTION & INGESTION
+# DATA INGESTION & VECTOR INDEXING
 # ==========================================
 async def initialize_rag_knowledge_base():
     """
-    Reads college_info.json on startup, flattens the nested structures into clean 
-    standalone sentences, and pre-computes their vectors into server memory.
+    Reads college_info.json on startup, converts nested data into flat text chunks,
+    and pre-computes embeddings concurrently into server memory.
     """
     global KNOWLEDGE_CHUNKS, KNOWLEDGE_EMBEDDINGS
-    
-    if KNOWLEDGE_CHUNKS: # Prevent reprocessing if already cached in memory
+
+    if KNOWLEDGE_CHUNKS:  # Skip if already loaded
         return
 
     if not os.path.exists(JSON_PATH):
-        print(f"[RAG WARNING] Knowledge base file missing at expected path: {JSON_PATH}")
+        logger.warning(f"[RAG] Knowledge base file not found at: {JSON_PATH}")
         return
 
     with open(JSON_PATH, "r") as file:
         data = json.load(file)
 
-    raw_paragraphs = []
-    
-    # 1. Parse operational metadata
+    chunks = []
+
     c_info = data.get("college", {})
-    raw_paragraphs.append(
+    chunks.append(
         f"{c_info.get('name')} ({c_info.get('short_name')}) was established in {c_info.get('established')} "
         f"by founder {c_info.get('founder')}. It is an autonomous {c_info.get('type')} located at {c_info.get('location')}."
     )
-    
-    # 2. Parse administration details
-    admin = data.get("administration", {})
-    raw_paragraphs.append(f"The college working hours are {admin.get('working_hours')}.")
-    raw_paragraphs.append(f"The Director of RNSIT is {admin.get('director', {}).get('name')}. Contact phone: {admin.get('director', {}).get('phone')}.")
-    raw_paragraphs.append(f"The Principal of RNSIT is {admin.get('principal', {}).get('name')}. Contact phone: {admin.get('principal', {}).get('phone')}.")
 
-    # 3. Parse departments structural loop
+    admin = data.get("administration", {})
+    chunks.append(f"The college working hours are {admin.get('working_hours')}.")
+    chunks.append(f"The Director of RNSIT is {admin.get('director', {}).get('name')}. Contact phone: {admin.get('director', {}).get('phone')}.")
+    chunks.append(f"The Principal of RNSIT is {admin.get('principal', {}).get('name')}. Contact phone: {admin.get('principal', {}).get('phone')}.")
+
     for code, details in data.get("departments", {}).items():
-        raw_paragraphs.append(
+        chunks.append(
             f"The department of {details.get('name')} ({code.upper()}) is located in the {details.get('block', 'Main campus block')}. "
-            f"The Head of Department (HOD) is {details.get('hod', 'the appointed department head')} and the student intake capacity is {details.get('intake', '180')} students per year."
+            f"The HOD is {details.get('hod', 'the appointed department head')} and intake capacity is {details.get('intake', '180')} students per year."
         )
 
-    # 4. Parse facilities segments
     for name, details in data.get("facilities", {}).items():
         if isinstance(details, dict):
-            raw_paragraphs.append(
-                f"Facility: {name.replace('_', ' ').title()}. Details: {details.get('name', '')} {details.get('location', '')} {details.get('timings', '')} {details.get('details', '')}."
+            chunks.append(
+                f"Facility: {name.replace('_', ' ').title()}. "
+                f"Details: {details.get('name', '')} {details.get('location', '')} {details.get('timings', '')} {details.get('details', '')}."
             )
 
-    # 5. Parse placement stats
     placements = data.get("placements", {})
-    raw_paragraphs.append(f"RNSIT placements feature over {placements.get('total_companies')} total companies. Major recent recruiters include: {', '.join(placements.get('recent_recruiters', []))}.")
+    chunks.append(
+        f"RNSIT placements feature over {placements.get('total_companies')} total companies. "
+        f"Major recent recruiters include: {', '.join(placements.get('recent_recruiters', []))}."
+    )
     for year, stats in placements.get("stats", {}).items():
-        raw_paragraphs.append(f"In the year {year} placement cycle, the highest package (CTC) offered was {stats.get('highest_ctc_lpa')} LPA.")
+        chunks.append(f"In {year}, the highest package offered was {stats.get('highest_ctc_lpa')} LPA.")
 
-    print(f"[RAG] Generated {len(raw_paragraphs)} distinct factual paragraphs. Compiling vectors...")
-    
-    # Generate vector coordinates for every single paragraph segment sequentially
-    KNOWLEDGE_CHUNKS = raw_paragraphs
-    for paragraph in raw_paragraphs:
-        vector = await get_embedding(paragraph)
-        KNOWLEDGE_EMBEDDINGS.append(vector)
-    
-    print("🚀 [RAG SUCCESS] Core Knowledge Base vector grid loaded into server memory.")
+    logger.info(f"[RAG] Indexing {len(chunks)} chunks concurrently...")
+    KNOWLEDGE_CHUNKS = chunks
+    KNOWLEDGE_EMBEDDINGS = await asyncio.gather(*[get_embedding(chunk) for chunk in chunks])
+
+    logger.info("[RAG] Knowledge base fully loaded into memory.")
+
 
 # ==========================================
-# 4. SEMANTIC SEARCH & LLM INFERENCE
+# SEMANTIC RETRIEVAL
 # ==========================================
-async def retrieve_relevant_context(user_query: str, top_k: int = 3) -> str:
+async def retrieve_relevant_context(user_query: str, top_k: int = 3) -> tuple[str, float]:
     """
-    Embeds the user query, compares vectors using cosine similarity, 
-    and picks the top K closest matching context strings.
+    Embeds the user query, scores all chunks by cosine similarity,
+    and returns the top-k context strings joined as one block, plus the highest score.
     """
-    global KNOWLEDGE_CHUNKS, KNOWLEDGE_EMBEDDINGS
-    
     query_vector = await get_embedding(user_query)
     if not query_vector:
-        return "No context found."
+        return "No context found.", 0.0
 
-    scored_chunks = []
-    for idx, chunk_vector in enumerate(KNOWLEDGE_EMBEDDINGS):
-        score = cosine_similarity(query_vector, chunk_vector)
-        scored_chunks.append((score, KNOWLEDGE_CHUNKS[idx]))
+    scored_chunks = [
+        (float(cosine_similarity(query_vector, chunk_vector)), KNOWLEDGE_CHUNKS[idx])
+        for idx, chunk_vector in enumerate(KNOWLEDGE_EMBEDDINGS)
+    ]
+    scored_chunks.sort(key=lambda x: x[0], reverse=True)  # FIX 1: sort by score only, not full tuple
 
-    # Sort chunks strictly by their similarity scores (index 0) in descending order
-    scored_chunks.sort(key=lambda x: x, reverse=True)
-    
-    # Take the text content of the top matching segments
-    top_matches = [chunk for score, chunk in scored_chunks[:top_k]]
-    return "\n\n".join(top_matches)
+    max_score = scored_chunks[0][0] if scored_chunks else 0.0  # FIX 2: extract float from first tuple
+    top_matches = [chunk for _, chunk in scored_chunks[:top_k]]
 
+    return "\n\n".join(top_matches), max_score
+
+
+# ==========================================
+# RAG RESPONSE GENERATION
+# ==========================================
 async def generate_rag_kiosk_response(question: str, history: list = None) -> str:
     """
-    Generates a response using local semantic context search combined with 
-    a rolling short-term conversation history buffer.
+    Retrieves relevant context via semantic search, applies a similarity guardrail,
+    then generates a kiosk-appropriate response using the local Llama model.
     """
-    # 1. FIXED: Retrieve matching factual text directly as a string
-    context_text = await retrieve_relevant_context(question, top_k=3)
+    context_text, max_score = await retrieve_relevant_context(question, top_k=3)
+    logger.debug(f"[RAG] Query: '{question}' | Max similarity: {max_score:.4f}")
 
-    # 2. FIXED: Safely format rolling history using string casting to protect Enums
+    if max_score < SIMILARITY_THRESHOLD:
+        logger.info(f"[RAG] Guardrail triggered — score {max_score:.4f} below threshold.")
+        return (
+            "I am the RNSIT Campus Kiosk virtual assistant. I can only answer questions "
+            "regarding college departments, staff, timings, locations, and administration. "
+            "Please ask a campus-related question."
+        )
+
     history_context = ""
     if history:
-        history_context = "\n--- RECENT CONVERSATION HISTORY ---\n"
+        lines = ["--- RECENT CONVERSATION HISTORY ---"]
         for msg in history:
-            speaker_val = getattr(msg, "speaker", None) or (msg.get("speaker") if isinstance(msg, dict) else None)
-            text_val = getattr(msg, "text", None) or (msg.get("text") if isinstance(msg, dict) else None)
-            
+            speaker_val = msg.get("speaker") if isinstance(msg, dict) else getattr(msg, "speaker", None)
+            text_val = msg.get("text") if isinstance(msg, dict) else getattr(msg, "text", None)
             if speaker_val and text_val:
-                speaker = "Visitor" if str(speaker_val).lower() in ["visitor", "user"] else "Kiosk AI"
-                history_context += f"{speaker}: {text_val}\n"
-        history_context += "-----------------------------------\n"
+                speaker = "Visitor" if str(speaker_val).lower() in ("visitor", "user") else "Kiosk AI"
+                lines.append(f"{speaker}: {text_val}")
+        lines.append("-----------------------------------")
+        history_context = "\n".join(lines) + "\n"
 
-    # 3. Construct the brain prompt with both permanent facts and conversational memory
     system_prompt = (
         "You are the official AI Digital Receptionist for RNS Institute of Technology (RNSIT), Bengaluru.\n"
         "Your tone must be warm, helpful, polite, and professional. Keep answers concise (2-4 sentences max) "
         "as they will be displayed on a public kiosk screen.\n\n"
-        f"Use the following official verified campus facts to answer the visitor:\n{context_text}\n\n"
-        "CRITICAL RULES:\n"
-        "1. Rely ONLY on the verified facts above. If the answer cannot be found there, politely direct them to the Admin Block window.\n"
+        f"Use the following verified campus facts to answer the visitor:\n{context_text}\n\n"
+        "RULES:\n"
+        "1. Rely ONLY on the facts above. If the answer is not there, direct the visitor to the Admin Block.\n"
         "2. Do NOT invent phone numbers, emails, or office locations.\n"
-        "3. Use the conversation history below to resolve pronouns like 'he', 'she', 'it', 'there', or 'his'.\n"
+        "3. Use conversation history to resolve pronouns like 'he', 'she', 'it', or 'there'.\n"
     )
 
     full_prompt = f"{system_prompt}\n{history_context}\nNew Visitor Question: {question}\nKiosk AI Response:"
 
-    # 4. Stream the compiled prompt to your local Llama model
     payload = {
-        "model": "llama3.1",
+        "model": GENERATE_MODEL,
         "prompt": full_prompt,
         "stream": False,
-        "options": {
-            "temperature": 0.3  # Lower temperature keeps the response factual and precise
-        }
+        "options": {"temperature": 0.3},
     }
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(f"{OLLAMA_BASE_URL}/api/generate", json=payload)
-        if response.status_code == 200:
-            return response.json().get("response", "").strip()
-        else:
-            raise Exception(f"Ollama returned error status: {response.status_code}")
+    try:
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            response = await client.post(f"{OLLAMA_BASE_URL}/api/generate", json=payload)
+            if response.status_code == 200:
+                return response.json().get("response", "").strip()
+            logger.error(f"[Ollama] Status {response.status_code}: {response.text}")
+            return "I am having trouble accessing my AI engine. Please try again in a moment."
+    except httpx.ConnectError:
+        logger.critical(f"[Ollama] Could not connect to {OLLAMA_BASE_URL}. Is Ollama running?")
+        return "The kiosk AI engine is currently offline. Please visit the Admin Block for assistance."
+    except httpx.TimeoutException:
+        logger.warning("[Ollama] Request timed out — model may still be loading.")
+        return "The AI engine is taking a moment to spin up. Please try your question again."
+    except Exception as e:
+        logger.exception(f"[Ollama] Unexpected error: {e}")
+        return "An internal error occurred. Please visit the Admin Block."
