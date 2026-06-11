@@ -10,6 +10,7 @@ import uuid
 import shutil
 import logging
 import hashlib
+import string
 from pathlib import Path
 from datetime import datetime
 from typing import List
@@ -43,6 +44,15 @@ logger = logging.getLogger("RNSIT_Kiosk")
 
 ALLOWED_ORIGINS: List[str] = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 MAX_QUERY_LENGTH: int = 500
+
+# Dictionary mapping common spoken/STT typos to correct college domain terms
+DOMAINS_CORRECTIONS = {
+    "pricipal": "principal",
+    "prinsipal": "principal",
+    "libary": "library",
+    "placment": "placement",
+    "fees": "fee",
+}
 
 app = FastAPI(title="RNSIT Digital Receptionist")
 
@@ -231,20 +241,30 @@ async def post_message(payload: MessagePayload):
 
 @app.get("/ask")
 async def ask_kiosk(question: str = Query(..., description="Visitor question")):
-    q = question.lower().strip()
+    # 1. TEXT PREPROCESSING: Clean punctuation and casing (Fixes Cache Misses from spoken '?')
+    q_clean = question.lower().strip()
+    q_clean = q_clean.translate(str.maketrans('', '', string.punctuation)).strip()
+
+    # 2. TYPO NORMALIZATION: Intercept phonetic mistakes before vector or SQL tier execution
+    words = q_clean.split()
+    corrected_words = [DOMAINS_CORRECTIONS.get(w, w) for w in words]
+    q_normalized = " ".join(corrected_words)
+
     sid = active_session["session_id"] if active_session else "unknown"
     visitor_name = (active_session.get("user_name") or "there") if active_session else "there"
 
-    # Log visitor question to session history and broadcast to WS clients
+    # Log visitor original question to session history and broadcast to WS clients
     visitor_entry = _log_message(question, "visitor")
     await manager.broadcast({"type": "message", **visitor_entry})
 
     async def _respond(answer: str, source: str = "") -> dict:
-        """Save to DB, log to session history, broadcast, and return response."""
+        """Save to DB safely, log to session history, broadcast, and return response."""
         try:
             save_interaction(sid, question, answer)
         except Exception as exc:
-            logger.exception("DB interaction log failed: %s", exc)
+            # Prevents foreign key constraint violations from breaking user responses
+            logger.error("[DATABASE ERROR] Failed to log interaction cleanly: %s", exc)
+            
         kiosk_entry = _log_message(answer, "kiosk")
         await manager.broadcast({"type": "message", **kiosk_entry})
         result = {"question": question, "answer": answer}
@@ -252,10 +272,10 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
             result["source"] = source
         return result
 
-    # --- TIER 1: SQL — Fees ---
-    if any(kw in q for kw in ["fee", "fees", "cost", "price", "instalment", "payment"]):
+    # --- TIER 1: SQL — Fees (Using normalized text validation) ---
+    if any(kw in q_normalized for kw in ["fee", "cost", "price", "instalment", "payment"]):
         branch_keyword = next(
-            (b for b in ["cse", "ai", "data", "cyber", "ece", "vlsi", "eee", "mech", "civil"] if b in q),
+            (b for b in ["cse", "ai", "data", "cyber", "ece", "vlsi", "eee", "mech", "civil"] if b in q_normalized),
             None,
         )
         if branch_keyword:
@@ -280,8 +300,8 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
         return await _respond(answer)
 
     # --- TIER 1: SQL — Documents ---
-    if any(kw in q for kw in ["document", "documents", "certificate", "paperwork", "bring", "marks card"]):
-        quota = "KCET" if any(k in q for k in ["cet", "kea", "govt"]) else "Management"
+    if any(kw in q_normalized for kw in ["document", "certificate", "paperwork", "bring", "marks card"]):
+        quota = "KCET" if any(k in q_normalized for k in ["cet", "kea", "govt"]) else "Management"
         docs = get_admission_requirements(quota)
         if docs:
             doc_list = "\n".join(f"- {doc}" for doc in docs)
@@ -297,24 +317,25 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
         "hey": f"Hey {visitor_name}! Welcome to RNS Institute of Technology. What can I help with?",
         "ok":  "Alright! Let me know if you need any further assistance.",
     }
-    if q in short_greetings:
-        return await _respond(short_greetings[q])
+    if q_normalized in short_greetings:
+        return await _respond(short_greetings[q_normalized])
 
-    # --- PERFORMANCE LAYER: Redis cache ---
-    cache_key = f"kiosk:cache:{hashlib.md5(q.encode()).hexdigest()}"
+    # --- PERFORMANCE LAYER: Redis cache (Hashed using the processed query) ---
+    cache_key = f"kiosk:cache:{hashlib.md5(q_normalized.encode()).hexdigest()}"
     if redis_client:
         try:
             cached = redis_client.get(cache_key)
             if cached:
-                logger.info("[REDIS HIT] '%s'", question)
+                logger.info("[REDIS HIT] For normalized key: '%s'", q_normalized)
                 return await _respond(cached, source="redis_cache")
         except Exception as e:
             logger.warning("Redis read error: %s", e)
 
     # --- TIER 3: RAG / Llama 3.1 ---
-    logger.info("[CACHE MISS] Running RAG for: '%s'", question)
+    logger.info("[CACHE MISS] Running RAG for processed string: '%s'", q_normalized)
     try:
-        answer = await generate_rag_kiosk_response(question, history=message_log[:-1][-6:])
+        # Passing the corrected string ensures subword tokenization doesn't shatter embeddings
+        answer = await generate_rag_kiosk_response(q_normalized, history=message_log[:-1][-6:])
         if redis_client and answer:
             try:
                 redis_client.set(cache_key, answer, ex=3600)
