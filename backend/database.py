@@ -25,16 +25,22 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         ''')
+        # faces table WITH encoding column
         cur.execute('''
             CREATE TABLE IF NOT EXISTS faces (
                 id SERIAL PRIMARY KEY,
                 face_id VARCHAR(50) UNIQUE NOT NULL,
                 name VARCHAR(100) NOT NULL,
                 label_int INTEGER UNIQUE NOT NULL,
+                encoding FLOAT8[],
                 registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 visit_count INTEGER DEFAULT 1
             );
+        ''')
+        # Add encoding column if table already exists without it
+        cur.execute('''
+            ALTER TABLE faces ADD COLUMN IF NOT EXISTS encoding FLOAT8[];
         ''')
         cur.execute('''
             CREATE TABLE IF NOT EXISTS sessions (
@@ -164,7 +170,6 @@ def save_session(session_id, face_id, user_name, is_returning, visit_count):
     if not conn: return
     try:
         cur = conn.cursor()
-        # Use None instead of empty string for face_id to avoid FK constraint failure
         fid = face_id if face_id and face_id.strip() else None
         cur.execute('''
             INSERT INTO sessions (session_id, face_id, user_name, is_returning, visit_count)
@@ -208,6 +213,7 @@ def save_interaction(session_id, question, answer):
         conn.close()
     except Exception as e:
         print(f"save_interaction error: {e}")
+
 def save_face_image(face_id, image_index, image_bytes):
     conn = get_db_connection()
     if not conn: return
@@ -251,20 +257,18 @@ def delete_face_images(face_id):
         conn.close()
     except Exception as e:
         print(f"delete_face_images error: {e}")
-        
+
 def get_admission_fee_by_branch(search_term: str):
-    """Searches the management fees table for a specific branch matching keywords."""
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        # Using ILIKE for case-insensitive partial matching
         query = """
-            SELECT branch_full_name, annual_fee, instalment_1, instalment_2 
-            FROM public.management_program_fees 
+            SELECT branch_full_name, annual_fee, instalment_1, instalment_2
+            FROM public.management_program_fees
             WHERE LOWER(branch_full_name) LIKE %s OR LOWER(branch_code) LIKE %s;
         """
         cursor.execute(query, (f"%{search_term}%", f"%{search_term}%"))
-        return cursor.fetchone() # Returns a single row if found
+        return cursor.fetchone()
     except Exception as e:
         print(f"Error querying management fees: {e}")
         return None
@@ -273,20 +277,54 @@ def get_admission_fee_by_branch(search_term: str):
         conn.close()
 
 def get_admission_requirements(quota_type: str):
-    """Fetches all mandatory documents required for a specific entry quota."""
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
         query = """
-            SELECT document_name, copies_required 
-            FROM public.admission_requirements 
+            SELECT document_name, copies_required
+            FROM public.admission_requirements
             WHERE LOWER(quota_type) = LOWER(%s);
         """
         cursor.execute(query, (quota_type,))
-        return cursor.fetchall() # Returns list of document tuples
+        return cursor.fetchall()
     except Exception as e:
         print(f"Error querying requirements: {e}")
         return []
     finally:
         cursor.close()
         conn.close()
+
+def save_face_encoding(face_id, name, encoding):
+    conn = get_db_connection()
+    if not conn: return
+    try:
+        label_int = get_next_label_int()
+        cur = conn.cursor()
+        cur.execute('''
+            INSERT INTO faces (label_int, face_id, name, encoding)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (face_id) DO UPDATE
+            SET name = EXCLUDED.name,
+                encoding = EXCLUDED.encoding,
+                last_seen = CURRENT_TIMESTAMP
+        ''', (label_int, face_id, name, encoding))
+        conn.commit()
+        cur.close()
+        conn.close()
+        print(f"[DB] Face encoding saved: {name} ({face_id})")
+    except Exception as e:
+        print(f"save_face_encoding error: {e}")
+
+def get_all_face_encodings():
+    conn = get_db_connection()
+    if not conn: return []
+    try:
+        cur = conn.cursor()
+        cur.execute('SELECT face_id, name, encoding FROM faces WHERE encoding IS NOT NULL')
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return [{'face_id': r[0], 'name': r[1], 'encoding': list(r[2])} for r in rows]
+    except Exception as e:
+        print(f"get_all_face_encodings error: {e}")
+        return []
