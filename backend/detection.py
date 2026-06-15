@@ -1,237 +1,398 @@
-import cv2, requests, time, os, collections, sys, hashlib
+"""
+detection.py — EP-07 Presence Detection & Face Recognition Pipeline
+VRK/RNS Digital Receptionist
+"""
+
+import os
+import cv2
 import numpy as np
-from pathlib import Path
-from datetime import datetime
-from dotenv import load_dotenv
-from database import get_all_faces, save_face, update_face_seen, delete_face_by_name, get_next_label_int, init_db, save_face_image, load_face_images, save_face_image, load_face_images
+import base64
+import logging
+import urllib.request
+import time
+import uuid
+import threading
+import httpx
+from dataclasses import dataclass
+from typing import Optional
 
-load_dotenv()
+import mediapipe as mp
+from mediapipe.tasks import python as mp_tasks
+from mediapipe.tasks.python import vision as mp_vision
+from deepface import DeepFace
 
-BACKEND       = os.getenv('BACKEND_URL',           'http://127.0.0.1:8000')
-THRESHOLD     = int(os.getenv('PASSERBY_THRESHOLD', 80))
-FRAME_WINDOW  = int(os.getenv('FRAME_WINDOW',       10))
-WALK_AWAY_SEC = int(os.getenv('WALK_AWAY_SECONDS',   5))
-CAM_INDEX     = int(os.getenv('CAMERA_INDEX',        0))
-CONFIDENCE_MAX = 55.0
+logger = logging.getLogger(__name__)
 
-MODEL_PATH = Path("face_model.yml")
+BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8000")
 
-face_cascade = cv2.CascadeClassifier(
-    cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+# ─── Model auto-download ──────────────────────────────────────────────────────
+_MODEL_PATH = os.path.join(os.path.dirname(__file__), "face_landmarker.task")
+_MODEL_URL  = (
+    "https://storage.googleapis.com/mediapipe-models/"
+    "face_landmarker/face_landmarker/float16/1/face_landmarker.task"
 )
-recognizer = cv2.face.LBPHFaceRecognizer_create()
 
-def train_model(label_map):
-    faces, labels = [], []
-    for lid, info in label_map.items():
-        images = load_face_images(info["face_id"])
-        for img_bytes in images:
-            import numpy as np
-            nparr = np.frombuffer(img_bytes, np.uint8)
-            img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
-            if img is not None:
-                faces.append(img); labels.append(lid)
-    if faces:
-        recognizer.train(faces, np.array(labels))
-        recognizer.save(str(MODEL_PATH))
-        print(f"[MODEL] Trained on {len(faces)} images, {len(label_map)} person(s).")
+def _ensure_model():
+    if not os.path.exists(_MODEL_PATH):
+        logger.info("Downloading face_landmarker.task (~5 MB)...")
+        urllib.request.urlretrieve(_MODEL_URL, _MODEL_PATH)
+        logger.info("Model downloaded.")
 
-def load_model(label_map):
-    if MODEL_PATH.exists() and label_map:
-        try:
-            recognizer.read(str(MODEL_PATH))
-            print(f"[MODEL] Loaded. Known: {[v['name'] for v in label_map.values()]}")
-        except:
-            train_model(label_map)
-    elif label_map:
-        train_model(label_map)
+_ensure_model()
 
-def post(endpoint, params=None, body=None):
+# ─── MediaPipe FaceLandmarker ─────────────────────────────────────────────────
+_base_opts = mp_tasks.BaseOptions(model_asset_path=_MODEL_PATH)
+_lm_opts   = mp_vision.FaceLandmarkerOptions(
+    base_options=_base_opts,
+    running_mode=mp_vision.RunningMode.IMAGE,
+    num_faces=1,
+    min_face_detection_confidence=0.6,
+    min_face_presence_confidence=0.6,
+    min_tracking_confidence=0.5,
+)
+FACE_LANDMARKER = mp_vision.FaceLandmarker.create_from_options(_lm_opts)
+
+# ─── DeepFace config ──────────────────────────────────────────────────────────
+DEEPFACE_MODEL    = "Facenet512"
+DEEPFACE_DETECTOR = "opencv"
+COSINE_THRESHOLD  = 0.30
+
+# ─── Global state ─────────────────────────────────────────────────────────────
+_asking_name:        bool  = False
+_last_trigger_ts:    float = 0.0
+_COOLDOWN:           float = 120.0
+_last_known_identity: str  = ""   # keeps name visible during cooldown
+_known_faces_cache:  list  = []   # refreshed after every registration
+
+
+# ─── Data classes ─────────────────────────────────────────────────────────────
+@dataclass
+class BoundingBox:
+    x: int
+    y: int
+    w: int
+    h: int
+
+@dataclass
+class DetectionResult:
+    present:       bool
+    bbox:          Optional[BoundingBox]
+    face_crop:     Optional[np.ndarray]
+    identity:      Optional[str]        = None
+    verified:      bool                 = False
+    confidence:    float                = 0.0
+    landmarks_img: Optional[np.ndarray] = None
+    error:         Optional[str]        = None
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def _decode_frame(data) -> np.ndarray:
+    if isinstance(data, np.ndarray):
+        return data
+    arr   = np.frombuffer(data, dtype=np.uint8)
+    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if frame is None:
+        raise ValueError("Could not decode image bytes.")
+    return frame
+
+def _get_bbox(landmarks, img_w, img_h, pad=20) -> BoundingBox:
+    xs = [lm.x * img_w for lm in landmarks]
+    ys = [lm.y * img_h for lm in landmarks]
+    x1 = max(0,     int(min(xs)) - pad)
+    y1 = max(0,     int(min(ys)) - pad)
+    x2 = min(img_w, int(max(xs)) + pad)
+    y2 = min(img_h, int(max(ys)) + pad)
+    return BoundingBox(x=x1, y=y1, w=x2 - x1, h=y2 - y1)
+
+def _draw_landmarks(frame, landmarks, img_w, img_h) -> np.ndarray:
+    out = frame.copy()
+    for lm in landmarks:
+        cv2.circle(out, (int(lm.x * img_w), int(lm.y * img_h)), 1, (0, 255, 0), -1)
+    return out
+
+def _cosine_similarity(a, b) -> float:
+    a, b  = np.array(a, dtype=np.float32), np.array(b, dtype=np.float32)
+    denom = np.linalg.norm(a) * np.linalg.norm(b)
+    if denom == 0:
+        return 0.0
+    return float(np.dot(a, b) / denom)
+
+
+# ─── Backend HTTP helpers ─────────────────────────────────────────────────────
+
+def _post(path, **kwargs):
     try:
-        r = requests.post(f'{BACKEND}{endpoint}', params=params, json=body, timeout=3)
-        return r.json()
+        return httpx.post(f"{BACKEND_URL}{path}", timeout=5, **kwargs)
     except Exception as e:
-        print(f"[BACKEND] {endpoint} error: {e}")
+        logger.warning(f"POST {path} failed: {e}")
         return None
 
-def get(endpoint):
+def _get(path):
     try:
-        return requests.get(f'{BACKEND}{endpoint}', timeout=3).json()
-    except: return None
+        return httpx.get(f"{BACKEND_URL}{path}", timeout=5)
+    except Exception as e:
+        logger.warning(f"GET {path} failed: {e}")
+        return None
 
-def start_session(name, is_returning, visit_count, face_id='', session_id=None):
-    r = post('/session/start', params={
-        'trigger': 'camera', 'user_name': name,
-        'is_returning': str(is_returning).lower(),
-        'visit_count': visit_count,
-        'face_id': face_id,
-        'session_id': session_id or ''
-    })
-    return r.get('session_id') if r else None
+def _load_known_faces() -> list:
+    try:
+        r = httpx.get(f"{BACKEND_URL}/faces/all", timeout=5)
+        if r and r.status_code == 200:
+            faces = r.json().get("faces", [])
+            logger.info(f"[DETECTION] Loaded {len(faces)} known faces from DB")
+            return faces
+        else:
+            logger.warning(f"[DETECTION] /faces/all returned {r.status_code if r else 'no response'}")
+    except Exception as e:
+        logger.warning(f"Could not load known faces: {e}")
+    return []
 
-def ask_name_on_screen():
-    post('/visitor/unknown')
 
-def poll_name_response(timeout=60):
-    print("[WAITING] Waiting for visitor to enter name on screen...")
-    start = time.time()
-    while time.time() - start < timeout:
-        result = get('/visitor/name_response')
-        if result and result.get('ready'):
-            name = result.get('name', 'Guest').strip() or 'Guest'
-            save = result.get('save', True)
-            post('/visitor/clear_response')
-            return name, save
-        time.sleep(1)
-    print("[TIMEOUT] No name entered - using Guest.")
-    return "Guest", False
+# ─── Step 1: Presence ─────────────────────────────────────────────────────────
 
-def capture_samples(cam, face_id):
-    print("[CAPTURE] Capturing 30 face samples - please look at camera...")
-    count = 0
-    while count < 30:
-        ok, frame = cam.read()
-        if not ok: continue
-        gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.3, 5)
-        for (x, y, w, h) in faces:
-            roi = cv2.resize(gray[y:y+h, x:x+w], (200, 200))
-            _, buffer = cv2.imencode(".jpg", roi)
-            save_face_image(face_id, count, buffer.tobytes())
-            count += 1
-            cv2.rectangle(frame, (x,y), (x+w,y+h), (0,255,0), 2)
-            cv2.putText(frame, f"Saving sample {count}/30", (x, y-10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
-        cv2.imshow("RNS Digital Receptionist", frame)
-        cv2.waitKey(80)
-    print("[CAPTURE] Done - 30 samples saved to PostgreSQL.")
-#OLD_CAPTURE_REPLACED
+def detect_presence(frame: np.ndarray, draw_mesh: bool = False) -> DetectionResult:
+    rgb       = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    mp_image  = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    detection = FACE_LANDMARKER.detect(mp_image)
 
-def run():
-    init_db()
-    label_map = get_all_faces()
-    load_model(label_map)
+    if not detection.face_landmarks:
+        return DetectionResult(present=False, bbox=None, face_crop=None)
 
-    cam = cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW)
-    if not cam.isOpened():
-        print("[ERROR] Cannot open camera.")
+    h, w      = frame.shape[:2]
+    landmarks = detection.face_landmarks[0]
+    bbox      = _get_bbox(landmarks, w, h)
+    face_crop = frame[bbox.y : bbox.y + bbox.h, bbox.x : bbox.x + bbox.w].copy()
+    mesh_img  = _draw_landmarks(frame, landmarks, w, h) if draw_mesh else None
+
+    return DetectionResult(present=True, bbox=bbox, face_crop=face_crop, landmarks_img=mesh_img)
+
+
+# ─── Step 2: Extract embedding ────────────────────────────────────────────────
+
+def extract_embedding(face_crop: np.ndarray) -> Optional[list]:
+    try:
+        _, enc  = cv2.imencode(".jpg", face_crop)
+        img_arr = cv2.imdecode(enc, cv2.IMREAD_COLOR)
+        res = DeepFace.represent(
+            img_path          = img_arr,
+            model_name        = DEEPFACE_MODEL,
+            detector_backend  = DEEPFACE_DETECTOR,
+            enforce_detection = False,
+        )
+        return res[0]["embedding"]
+    except Exception as e:
+        logger.error(f"Embedding failed: {e}")
+        return None
+
+
+# ─── Step 3: Recognise ────────────────────────────────────────────────────────
+
+def recognize_face(face_crop: np.ndarray, known_faces: list) -> tuple:
+    if not known_faces:
+        return False, None, None, 0.0
+
+    probe_emb = extract_embedding(face_crop)
+    if probe_emb is None:
+        return False, None, None, 0.0
+
+    best_sim     = -1.0
+    best_name    = None
+    best_face_id = None
+
+    for entry in known_faces:
+        stored_enc = entry.get("encoding")
+        if not stored_enc:
+            continue
+        sim = _cosine_similarity(probe_emb, stored_enc)
+        if sim > best_sim:
+            best_sim     = sim
+            best_name    = entry["name"]
+            best_face_id = entry["face_id"]
+
+    verified   = best_sim >= (1.0 - COSINE_THRESHOLD)
+    confidence = round(max(0.0, best_sim), 4)
+    logger.info(f"[DETECTION] Best match: '{best_name}' sim={confidence:.4f} verified={verified}")
+
+    if verified:
+        return True, best_name, best_face_id, confidence
+    return False, None, None, confidence
+
+
+# ─── Background: unknown visitor flow ─────────────────────────────────────────
+
+def _handle_unknown_visitor(face_crop: np.ndarray):
+    """
+    Runs in daemon thread.
+    Order:
+      1. Poll for name (frontend already showing input via /visitor/unknown)
+      2. Save face to DB first (/face/register)
+      3. Then start session (/session/start) — face_id now exists in DB
+      4. Refresh cache
+    """
+    global _asking_name, _known_faces_cache, _last_known_identity, _last_trigger_ts
+    try:
+        r = _post("/visitor/unknown")
+        if not r or r.status_code != 200:
+            logger.warning("[DETECTION] /visitor/unknown call failed")
+            return
+
+        logger.info("[DETECTION] Waiting for visitor name...")
+
+        deadline  = time.time() + 30.0
+        name_data = None
+
+        while time.time() < deadline:
+            r = _get("/visitor/name_response")
+            if r and r.status_code == 200:
+                data = r.json()
+                if data.get("ready"):
+                    name_data = data
+                    _post("/visitor/clear_response")
+                    break
+            time.sleep(0.5)
+
+        visitor_name = (name_data.get("name") or "Guest").strip() if name_data else "Guest"
+        save_face    = name_data.get("save", True)                 if name_data else False
+        new_face_id  = str(uuid.uuid4())
+
+        logger.info(f"[DETECTION] Name received: '{visitor_name}' save={save_face}")
+
+        # ★ STEP 1: Save face to DB FIRST so face_id exists before session references it
+        if save_face and visitor_name not in ("Guest", ""):
+            embedding = extract_embedding(face_crop)
+            if embedding:
+                resp = _post("/faces/register", json={
+                    "face_id":  new_face_id,
+                    "name":     visitor_name,
+                    "encoding": embedding,
+                })
+                if resp and resp.status_code == 200:
+                    logger.info(f"[DETECTION] Face registered: {visitor_name}")
+                    _known_faces_cache   = _load_known_faces()
+                    _last_known_identity = visitor_name
+                else:
+                    logger.warning(f"[DETECTION] /faces/register failed: {resp}")
+            else:
+                logger.warning("[DETECTION] Embedding failed — face not saved")
+
+        # ★ STEP 2: Start session AFTER face is saved
+        _post("/session/start", params={
+            "user_name":    visitor_name,
+            "face_id":      new_face_id if (save_face and visitor_name not in ("Guest", "")) else "",
+            "is_returning": False,
+            "visit_count":  1,
+            "trigger":      "camera",
+        })
+
+    except Exception as e:
+        logger.error(f"[DETECTION] _handle_unknown_visitor error: {e}")
+    finally:
+        _last_trigger_ts = time.time() + 60.0  # 60s grace — won't retrigger immediately
+        _asking_name     = False
+
+
+# ─── Main pipeline ────────────────────────────────────────────────────────────
+
+def run_pipeline(frame_data, known_faces: list = None, draw_mesh: bool = False) -> DetectionResult:
+    global _asking_name, _last_trigger_ts, _known_faces_cache, _last_known_identity
+
+    try:
+        frame = _decode_frame(frame_data)
+    except Exception as e:
+        return DetectionResult(present=False, bbox=None, face_crop=None, error=str(e))
+
+    result = detect_presence(frame, draw_mesh=draw_mesh)
+    if not result.present:
+        return result
+
+    if _asking_name:
+        result.identity = "Identifying..."
+        return result
+
+    now = time.time()
+    if now - _last_trigger_ts < _COOLDOWN:
+        # In cooldown — show last known name so screen doesn't blank out
+        if _last_known_identity:
+            result.identity = _last_known_identity
+            result.verified = True
+        return result
+
+    # Always use global cache
+    verified, name, face_id, confidence = recognize_face(result.face_crop, _known_faces_cache)
+    result.verified   = verified
+    result.confidence = confidence
+
+    if verified and name:
+        result.identity      = name
+        _last_known_identity = name
+        _last_trigger_ts     = now
+        _post("/session/start", params={
+            "user_name":    name,
+            "face_id":      face_id,
+            "is_returning": True,
+            "visit_count":  1,
+            "trigger":      "camera",
+        })
+        logger.info(f"[DETECTION] Returning visitor: {name} (sim={confidence})")
+    else:
+        _last_known_identity = ""
+        _last_trigger_ts     = now
+        _asking_name         = True
+        threading.Thread(
+            target=_handle_unknown_visitor,
+            args=(result.face_crop.copy(),),
+            daemon=True,
+        ).start()
+
+    return result
+
+
+# ─── Utility ──────────────────────────────────────────────────────────────────
+
+def face_crop_to_b64(face_crop: np.ndarray) -> str:
+    _, buf = cv2.imencode(".jpg", face_crop)
+    return base64.b64encode(buf.tobytes()).decode("utf-8")
+
+
+# ─── Local webcam test ────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    import sys
+    logging.basicConfig(level=logging.INFO)
+
+    src = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else \
+          sys.argv[1]       if len(sys.argv) > 1 else 0
+
+    cap = cv2.VideoCapture(src)
+    if not cap.isOpened():
+        print(f"Cannot open source: {src}")
         sys.exit(1)
 
-    cx_history     = collections.deque(maxlen=FRAME_WINDOW)
-    session_active = False
-    current_session = None
-    last_face_time  = 0
-
-    print("[INFO] Camera active. Press Q to quit.")
+    print("Running — press Q to quit.")
+    _known_faces_cache = _load_known_faces()
 
     while True:
-        ok, frame = cam.read()
-        if not ok: continue
-
-        gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.3, 5)
-
-        if len(faces) > 0:
-            (x, y, w, h) = faces[0]
-            cx = x + w // 2
-            last_face_time = time.time()
-            cx_history.append(cx)
-
-            color = (0,255,0) if session_active else (0,255,255)
-            cv2.rectangle(frame, (x,y), (x+w,y+h), color, 2)
-
-            if label_map and MODEL_PATH.exists():
-                try:
-                    roi = cv2.resize(gray[y:y+h, x:x+w], (200,200))
-                    pid, conf = recognizer.predict(roi)
-                    label = label_map[pid]["name"] if conf < CONFIDENCE_MAX and pid in label_map else "Unknown"
-                    cv2.putText(frame, label, (x, y-10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-                except: pass
-
-            if len(cx_history) == FRAME_WINDOW and not session_active:
-                movement = max(cx_history) - min(cx_history)
-                if movement > THRESHOLD:
-                    cx_history.clear()
-                else:
-                    print('[VISITOR] Stopped in front of kiosk!')
-                    cx_history.clear()
-
-                    name         = "Guest"
-                    is_returning = False
-                    visit_count  = 1
-                    recognized   = False
-
-                    if label_map and MODEL_PATH.exists():
-                        try:
-                            roi = cv2.resize(gray[y:y+h, x:x+w], (200,200))
-                            pid, conf = recognizer.predict(roi)
-                            if conf < CONFIDENCE_MAX and pid in label_map:
-                                info = label_map[pid]
-                                name             = info["name"]
-                                visit_count      = info.get("visit_count", 1) + 1
-                                is_returning     = True
-                                recognized       = True
-                                recognized_face_id = info["face_id"]
-                                update_face_seen(info["face_id"])
-                                label_map[pid]["visit_count"] = visit_count
-                                label_map[pid]["last_seen"]   = datetime.now().isoformat()
-                                print(f"[RECOGNIZED] {name} - visit #{visit_count} (conf:{conf:.1f})")
-                        except Exception as e:
-                            print(f"[WARN] {e}")
-
-                    if not recognized:
-                        ask_name_on_screen()
-                        name, save_to_db = poll_name_response(timeout=60)
-
-                        if save_to_db and name != "Guest":
-                            face_id  = hashlib.sha256(
-                                f"{name}_{datetime.now().isoformat()}".encode()
-                            ).hexdigest()[:12]
-                            label_id = get_next_label_int()
-                            # Save face to DB FIRST before capturing images
-                            # so foreign key constraint is satisfied
-                            save_face(label_id, face_id, name)
-                            capture_samples(cam, face_id)
-                            label_map[label_id] = {
-                                "face_id":     face_id,
-                                "name":        name,
-                                "registered":  datetime.now().isoformat(),
-                                "last_seen":   datetime.now().isoformat(),
-                                "visit_count": 1
-                            }
-                            train_model(label_map)
-                            print(f"[REGISTERED] '{name}' saved to PostgreSQL.")
-                        else:
-                            print(f"[GUEST] '{name}' chose not to save.")
-
-                    if recognized:
-                        current_face_id = recognized_face_id
-                    elif save_to_db and name != "Guest":
-                        current_face_id = face_id
-                    else:
-                        current_face_id = ""
-                    # Use face_id as session_id so same person always has same session
-                    sid = start_session(name, is_returning, visit_count, current_face_id, session_id=current_face_id if current_face_id else None)
-                    if sid:
-                        current_session = sid
-                        session_active  = True
-
-        else:
-            cx_history.clear()
-            if session_active and (time.time() - last_face_time > WALK_AWAY_SEC):
-                print('[WALK-AWAY] Visitor left.')
-                post('/session/end', params={'session_id': current_session})
-                session_active  = False
-                current_session = None
-                label_map = get_all_faces()
-
-        cv2.imshow('RNS Digital Receptionist', frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        ret, frame = cap.read()
+        if not ret:
             break
 
-    cam.release()
-    cv2.destroyAllWindows()
+        result  = run_pipeline(frame, draw_mesh=True)
+        display = result.landmarks_img if result.landmarks_img is not None else frame.copy()
 
-if __name__ == '__main__':
-    run()
+        if result.present and result.bbox:
+            b     = result.bbox
+            color = (0, 255, 0) if result.verified else (0, 165, 255)
+            cv2.rectangle(display, (b.x, b.y), (b.x + b.w, b.y + b.h), color, 2)
+            label = result.identity or "Unknown"
+            cv2.putText(display, label, (b.x, b.y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+        else:
+            cv2.putText(display, "NO FACE", (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 2)
+
+        cv2.imshow("VRK Digital Receptionist", display)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
