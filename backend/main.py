@@ -1,8 +1,8 @@
 """
 RNSIT Digital Receptionist - Backend Server
 
-HOW TO RUN (always from VRK_MVP/ folder, not from inside backend/):
-    python -m uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000
+HOW TO RUN (always from VRK_MVP/ folder):
+    python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
 """
 
 import os
@@ -54,7 +54,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Redis / Memurai cache
+# Redis / Memurai
 try:
     redis_client = redis.Redis(host="localhost", port=6379, decode_responses=True)
     redis_client.ping()
@@ -126,7 +126,6 @@ async def websocket_endpoint(ws: WebSocket):
 # ==========================================
 
 def _log_message(text: str, speaker: str) -> dict:
-    """Append a message to the in-memory log and return the entry."""
     entry = {
         "index":     len(message_log),
         "text":      text,
@@ -138,7 +137,7 @@ def _log_message(text: str, speaker: str) -> dict:
 
 
 # ==========================================
-# HEALTH CHECK
+# HEALTH
 # ==========================================
 
 @app.get("/")
@@ -147,7 +146,7 @@ def root():
 
 
 # ==========================================
-# SESSION ENDPOINTS
+# SESSION
 # ==========================================
 
 @app.post("/session/start")
@@ -173,7 +172,10 @@ async def start_session(
     }
     message_log = []
 
-    save_session(final_session_id, face_id or None, user_name, is_returning, visit_count)
+    # Only pass face_id to DB if it's non-empty — avoids FK constraint error
+    # when face was not registered (Guest sessions)
+    db_face_id = face_id.strip() if face_id and face_id.strip() else None
+    save_session(final_session_id, db_face_id, user_name, is_returning, visit_count)
     await manager.broadcast({"type": "session_start", "session": active_session})
     return {"status": "success", "session_id": final_session_id, "session": active_session}
 
@@ -203,12 +205,12 @@ def get_session_messages(session_id: str, after: int = 0):
 
 
 # ==========================================
-# MESSAGE ENDPOINT
+# MESSAGE
 # ==========================================
 
 class MessagePayload(BaseModel):
     session_id: str = Field(..., description="Session identifier")
-    text: str = Field(..., description="Message text from visitor or system")
+    text: str = Field(..., description="Message text")
     speaker: str = Field(..., description="Speaker id/name")
 
     @field_validator("text")
@@ -226,7 +228,7 @@ async def post_message(payload: MessagePayload):
 
 
 # ==========================================
-# ASK ENDPOINT
+# ASK
 # ==========================================
 
 @app.get("/ask")
@@ -235,12 +237,10 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
     sid = active_session["session_id"] if active_session else "unknown"
     visitor_name = (active_session.get("user_name") or "there") if active_session else "there"
 
-    # Log visitor question to session history and broadcast to WS clients
     visitor_entry = _log_message(question, "visitor")
     await manager.broadcast({"type": "message", **visitor_entry})
 
     async def _respond(answer: str, source: str = "") -> dict:
-        """Save to DB, log to session history, broadcast, and return response."""
         try:
             save_interaction(sid, question, answer)
         except Exception as exc:
@@ -252,7 +252,7 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
             result["source"] = source
         return result
 
-    # --- TIER 1: SQL — Fees ---
+    # --- TIER 1: Fees ---
     if any(kw in q for kw in ["fee", "fees", "cost", "price", "instalment", "payment"]):
         branch_keyword = next(
             (b for b in ["cse", "ai", "data", "cyber", "ece", "vlsi", "eee", "mech", "civil"] if b in q),
@@ -276,10 +276,9 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
                 answer = "I couldn't find the exact fee for that stream. Management fees range from ₹1,10,000 to ₹7,50,000/year. Which branch are you asking about?"
         else:
             answer = "Management fees range from ₹1,10,000 (Civil) to ₹7,50,000/year (Core CSE). Name a specific branch for exact figures!"
-
         return await _respond(answer)
 
-    # --- TIER 1: SQL — Documents ---
+    # --- TIER 1: Documents ---
     if any(kw in q for kw in ["document", "documents", "certificate", "paperwork", "bring", "marks card"]):
         quota = "KCET" if any(k in q for k in ["cet", "kea", "govt"]) else "Management"
         docs = get_admission_requirements(quota)
@@ -288,10 +287,9 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
             answer = f"For {quota} Quota admissions, bring originals and photocopies of:\n{doc_list}"
         else:
             answer = "Please bring your 10th and 12th Marks Cards, Transfer Certificate, Entrance Exam Rank Card, and ID copies to the Admin Block."
-
         return await _respond(answer)
 
-    # --- TIER 2: Static intercepts ---
+    # --- TIER 2: Static greetings ---
     short_greetings = {
         "hi":  f"Hi {visitor_name}! Welcome to RNSIT. How can I help you today?",
         "hey": f"Hey {visitor_name}! Welcome to RNS Institute of Technology. What can I help with?",
@@ -300,7 +298,7 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
     if q in short_greetings:
         return await _respond(short_greetings[q])
 
-    # --- PERFORMANCE LAYER: Redis cache ---
+    # --- Redis cache ---
     cache_key = f"kiosk:cache:{hashlib.md5(q.encode()).hexdigest()}"
     if redis_client:
         try:
@@ -311,7 +309,7 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
         except Exception as e:
             logger.warning("Redis read error: %s", e)
 
-    # --- TIER 3: RAG / Llama 3.1 ---
+    # --- TIER 3: RAG ---
     logger.info("[CACHE MISS] Running RAG for: '%s'", question)
     try:
         answer = await generate_rag_kiosk_response(question, history=message_log[:-1][-6:])
@@ -328,13 +326,15 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
 
 
 # ==========================================
-# VISITOR ENDPOINTS
+# VISITOR
 # ==========================================
 
 @app.post("/visitor/unknown")
 async def visitor_unknown():
     global visitor_name_response, active_session
-    visitor_name_response = {"ready": False, "name": "", "save": True}
+    # Only reset if NOT already waiting on a submitted name
+    if not visitor_name_response.get("ready"):
+        visitor_name_response = {"ready": False, "name": "", "save": True}
 
     if active_session is None:
         active_session = {
@@ -359,6 +359,7 @@ async def submit_name(name: str = "Guest", save: bool = True):
     if active_session:
         active_session["asking_name"] = False
         active_session["user_name"] = name
+    logger.info(f"[VISITOR] Name submitted: '{name}' save={save}")
     return {"status": "ok"}
 
 
@@ -393,7 +394,7 @@ async def delete_my_data(name: str):
 
 
 # ==========================================
-# FACE REGISTRATION
+# FACE  — routes use /faces/ prefix
 # ==========================================
 
 class RegisterFacePayload(BaseModel):
@@ -410,10 +411,31 @@ class RegisterFacePayload(BaseModel):
     @classmethod
     def _validate_encoding(cls, v: List[float]) -> List[float]:
         if not v:
-            raise ValueError("encoding must be a non-empty list of floats")
+            raise ValueError("encoding must be non-empty")
         return v
 
 
-@app.post("/face/register")
+@app.get("/faces/all")
+def get_all_faces_endpoint():
+    from backend.database import get_all_face_encodings
+    faces = get_all_face_encodings()
+    logger.info(f"[FACE] /faces/all returning {len(faces)} faces")
+    return {"faces": faces}
+
+
+@app.post("/faces/register")
 async def register_face(payload: RegisterFacePayload):
+    from backend.database import save_face_encoding
+    save_face_encoding(payload.face_id, payload.name, payload.encoding)
+    logger.info(f"[FACE] Registered: {payload.name} ({payload.face_id})")
     return {"status": "ok", "face_id": payload.face_id}
+
+
+# Keep old routes as aliases so nothing else breaks
+@app.get("/face/all")
+def get_all_faces_old():
+    return get_all_faces_endpoint()
+
+@app.post("/face/register")
+async def register_face_old(payload: RegisterFacePayload):
+    return await register_face(payload)
