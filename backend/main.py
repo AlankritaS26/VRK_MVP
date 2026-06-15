@@ -17,7 +17,7 @@ from typing import List
 import sys
 
 import redis
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 from dotenv import load_dotenv
@@ -33,6 +33,8 @@ from backend.database import (
     get_admission_fee_by_branch, get_admission_requirements,
 )
 from backend.llm import initialize_rag_knowledge_base, generate_rag_kiosk_response
+from backend.stt import transcribe_audio
+from backend.tts import text_to_speech
 
 load_dotenv()
 
@@ -236,7 +238,44 @@ async def post_message(payload: MessagePayload):
     await manager.broadcast({"type": "message", **entry})
     return {"status": "ok"}
 
+# ==========================================
+# STT ENDPOINT
+# ==========================================
 
+@app.post("/stt")
+async def speech_to_text(request: Request):
+    try:
+        audio_bytes = await request.body()
+        if not audio_bytes or len(audio_bytes) < 1000:
+            return {"text": "", "confidence": 0.0, "error": "No audio received"}
+        result = transcribe_audio(audio_bytes)
+        return result
+    except Exception as e:
+        logger.error(f"[STT] Endpoint error: {e}")
+        return {"text": "", "confidence": 0.0, "error": str(e)}
+
+
+# ==========================================
+# TTS ENDPOINT
+# ==========================================
+
+@app.post("/tts")
+async def text_to_speech_endpoint(request: Request):
+    try:
+        body = await request.json()
+        text = body.get("text", "").strip()
+        if not text:
+            return {"error": "No text provided"}
+        audio_bytes = text_to_speech(text)
+        if not audio_bytes:
+            return {"fallback": True, "text": text}
+        import base64
+        audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+        return {"audio": audio_b64, "fallback": False}
+    except Exception as e:
+        logger.error(f"[TTS] Endpoint error: {e}")
+        return {"fallback": True, "text": ""}
+    
 # ==========================================
 # ASK
 # ==========================================
