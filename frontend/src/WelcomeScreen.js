@@ -57,46 +57,76 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     if (!isMounted.current) return;
     if (isListening.current) return;
     if (isSpeaking.current) return;
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) return;
-    const recog           = new SR();
-    recog.lang            = 'en-US';
-    recog.continuous      = false;
-    recog.interimResults  = true;
-    recog.maxAlternatives = 3;
-    recog.onstart = () => {
-      isListening.current = true;
-      lastTranscript.current = '';
-      if (isMounted.current) { setListening(true); setLiveText(''); }
-    };
-    recog.onresult = (e) => {
-      let interim = '', final = '';
-      for (let i = 0; i < e.results.length; i++) {
-        const t = e.results[i][0].transcript;
-        if (e.results[i].isFinal) final += t;
-        else interim += t;
+
+    isListening.current = true;
+    setListening(true);
+    setLiveText('');
+
+    navigator.mediaDevices.getUserMedia({
+      audio: {
+        noiseSuppression: true,
+        echoCancellation: true,
+        autoGainControl: true
       }
-      const display = final || interim;
-      lastTranscript.current = display;
-      if (isMounted.current) setLiveText(display);
-    };
-    recog.onerror = (e) => {
+    }).then(stream => {
+      const audioChunks = [];
+      const mediaRecorder = new MediaRecorder(stream);
+
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) audioChunks.push(e.data);
+      };
+
+      mediaRecorder.onstop = async () => {
+        stream.getTracks().forEach(track => track.stop());
+        isListening.current = false;
+        if (isMounted.current) setListening(false);
+
+        console.log('[STT] chunks collected:', audioChunks.length);
+
+        if (audioChunks.length === 0) {
+          if (!isSpeaking.current && isMounted.current) setTimeout(startListening, 400);
+          return;
+        }
+
+        const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+        console.log('[STT] blob size:', audioBlob.size);
+        const arrayBuffer = await audioBlob.arrayBuffer();
+        const audioBytes = new Uint8Array(arrayBuffer);
+
+        try {
+          const response = await fetch(BACKEND + '/stt', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/octet-stream' },
+            body: audioBytes
+          });
+
+          const result = await response.json();
+          console.log('[STT WHISPER]', result);
+          const heard = (result.text || '').trim();
+
+          if (heard && heard.length > 1 && !isSpeaking.current) {
+            if (isMounted.current) setLiveText(heard);
+            sendToBackend(heard);
+          } else {
+            if (!isSpeaking.current && isMounted.current) setTimeout(startListening, 400);
+          }
+        } catch (err) {
+          console.error('[STT] fetch error:', err);
+          if (!isSpeaking.current && isMounted.current) setTimeout(startListening, 400);
+        }
+      };
+
+      // start(100) fires ondataavailable every 100ms — ensures chunks are collected
+      mediaRecorder.start(100);
+      setTimeout(() => {
+        if (mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+      }, 5000);
+
+    }).catch(err => {
+      console.error('[MIC] Error:', err);
       isListening.current = false;
       if (isMounted.current) setListening(false);
-      if (e.error !== 'no-speech' && e.error !== 'aborted') console.error('[STT]', e.error);
-      if (!isSpeaking.current && isMounted.current) setTimeout(startListening, 400);
-    };
-    recog.onend = () => {
-      isListening.current = false;
-      if (isMounted.current) setListening(false);
-      const heard = lastTranscript.current.trim().replace(/[.,!?]+$/, '').trim();
-      if (heard && heard.length >= 1 && !isSpeaking.current) {
-        console.log('[STT FINAL]', heard);
-        sendToBackend(heard);
-      }
-      else if (!isSpeaking.current && isMounted.current) setTimeout(startListening, 400);
-    };
-    try { recog.start(); } catch(e) { console.error(e); }
+    });
   }, []);
 
   const sendToBackend = useCallback(async (text) => {
@@ -106,7 +136,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     const sid = session?.session_id || 'guest';
     addMessage(text, 'user');
 
-    // End session on goodbye words
     const goodbyeWords = ['thank you', 'thanks', 'bye', 'goodbye', 'see you', 'ok bye', 'thank you so much'];
     if (goodbyeWords.some(w => text.toLowerCase().includes(w))) {
       addMessage('You are most welcome! Have a wonderful day. Goodbye!', 'kiosk');
