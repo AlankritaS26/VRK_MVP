@@ -12,10 +12,12 @@ import logging
 import hashlib
 import string
 import asyncio
+import sys
+import base64
 from pathlib import Path
 from datetime import datetime
 from typing import List
-import sys
+from contextlib import asynccontextmanager
 
 import redis
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect, Request
@@ -33,7 +35,7 @@ from backend.database import (
     delete_face_by_name, update_face_seen,
     get_admission_fee_by_branch, get_admission_requirements,
 )
-from backend.llm import initialize_rag_knowledge_base, generate_rag_kiosk_response
+from backend.llm import initialize_rag_knowledge_base, generate_rag_kiosk_response, close_llm_client
 from backend.stt import transcribe_audio
 from backend.tts import text_to_speech
 
@@ -57,17 +59,7 @@ DOMAINS_CORRECTIONS = {
     "fees":      "fee",
 }
 
-app = FastAPI(title="RNSIT Digital Receptionist")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=ALLOWED_ORIGINS != ["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Redis / Memurai
+# Redis / Memurai caching connection layer
 try:
     redis_client = redis.Redis(host="localhost", port=6379, decode_responses=True)
     redis_client.ping()
@@ -76,7 +68,7 @@ except Exception as e:
     logger.warning("[REDIS] Memurai unreachable: %s", e)
     redis_client = None
 
-# In-memory state
+# Shared state containers
 active_session: dict | None = None
 message_log: list[dict] = []
 visitor_name_response: dict = {"ready": False, "name": "", "save": True}
@@ -86,46 +78,73 @@ init_db()
 
 
 # ==========================================
-# STARTUP
+# BACKGROUND TIMEOUT LOOP
 # ==========================================
-
-@app.on_event("startup")
-async def startup_event():
-    logger.info("[SYSTEM] Booting server...")
-    try:
-        await initialize_rag_knowledge_base()
-        logger.info("[SYSTEM] RAG vector cache loaded.")
-    except Exception as e:
-        logger.error("[SYSTEM] RAG startup failed: %s", e)
-    # Start background session timeout checker
-    asyncio.create_task(_session_timeout_loop())
-
-
-# ==========================================
-# SESSION TIMEOUT BACKGROUND TASK
-# ==========================================
-
 async def _session_timeout_loop():
     """Every 30s, check if session has been idle for SESSION_TIMEOUT_SECONDS."""
     global active_session, _last_activity_ts
-    while True:
-        await asyncio.sleep(30)
-        if active_session and _last_activity_ts > 0:
-            idle = datetime.now().timestamp() - _last_activity_ts
-            if idle >= SESSION_TIMEOUT_SECONDS:
-                logger.info(f"[SESSION] Timeout after {idle:.0f}s idle — ending session")
-                sid = active_session.get("session_id")
-                if sid:
-                    end_session(sid)
-                active_session    = None
-                _last_activity_ts = 0.0
-                await manager.broadcast({"type": "session_end", "session_id": sid, "reason": "timeout"})
+    try:
+        while True:
+            await asyncio.sleep(30)
+            if active_session and _last_activity_ts > 0:
+                idle = datetime.now().timestamp() - _last_activity_ts
+                if idle >= SESSION_TIMEOUT_SECONDS:
+                    logger.info(f"[SESSION] Timeout after {idle:.0f}s idle — ending session")
+                    sid = active_session.get("session_id")
+                    if sid:
+                        end_session(sid)
+                    active_session    = None
+                    _last_activity_ts = 0.0
+                    await manager.broadcast({"type": "session_end", "session_id": sid, "reason": "timeout"})
+    except asyncio.CancelledError:
+        logger.info("[SESSION] Session timeout background task loop stopped cleanly.")
 
 
 # ==========================================
-# WEBSOCKET
+# SERVER LIFECYCLE (LIFESPAN)
 # ==========================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Handles unified startup initialization and shutdown teardown hooks."""
+    logger.info("[SYSTEM] Booting server resources...")
+    try:
+        await initialize_rag_knowledge_base()
+        logger.info("[SYSTEM] RAG vector cache loaded successfully.")
+    except Exception as e:
+        logger.error("[SYSTEM] RAG initialization failed during startup: %s", e)
+    
+    # Fire up the background task monitor
+    timeout_task = asyncio.create_task(_session_timeout_loop())
+    
+    yield  # Kiosk application handles active requests here
+    
+    logger.info("[SYSTEM] Triggering cleanup hooks...")
+    # 1. Terminate the background activity loop cleanly
+    timeout_task.cancel()
+    try:
+        await timeout_task
+    except asyncio.CancelledError:
+        pass
 
+    # 2. Reclaim persistent HTTP client sockets across llm.py workflows
+    await close_llm_client()
+    logger.info("[SYSTEM] Server teardown complete.")
+
+
+app = FastAPI(title="RNSIT Digital Receptionist", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=ALLOWED_ORIGINS != ["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ==========================================
+# WEBSOCKET BROADCASTER
+# ==========================================
 class ConnectionManager:
     def __init__(self):
         self.active: list[WebSocket] = []
@@ -135,14 +154,15 @@ class ConnectionManager:
         self.active.append(ws)
 
     def disconnect(self, ws: WebSocket):
-        self.active.remove(ws)
+        if ws in self.active:
+            self.active.remove(ws)
 
     async def broadcast(self, data: dict):
         for ws in self.active[:]:
             try:
                 await ws.send_json(data)
             except Exception:
-                self.active.remove(ws)
+                self.disconnect(ws)
 
 
 manager = ConnectionManager()
@@ -159,9 +179,8 @@ async def websocket_endpoint(ws: WebSocket):
 
 
 # ==========================================
-# HELPERS
+# UTILITY HELPERS
 # ==========================================
-
 def _log_message(text: str, speaker: str) -> dict:
     entry = {
         "index":     len(message_log),
@@ -174,18 +193,16 @@ def _log_message(text: str, speaker: str) -> dict:
 
 
 # ==========================================
-# HEALTH
+# HEALTH ENDPOINT
 # ==========================================
-
 @app.get("/")
 def root():
     return {"status": "RNSIT Kiosk Backend is Live"}
 
 
 # ==========================================
-# SESSION
+# SESSION MANAGEMENT ENDPOINTS
 # ==========================================
-
 @app.post("/session/start")
 async def start_session(
     trigger: str = "camera",
@@ -242,9 +259,8 @@ def get_session_messages(session_id: str, after: int = 0):
 
 
 # ==========================================
-# MESSAGE
+# MESSAGE ROUTING
 # ==========================================
-
 class MessagePayload(BaseModel):
     session_id: str = Field(..., description="Session identifier")
     text: str = Field(..., description="Message text")
@@ -265,9 +281,8 @@ async def post_message(payload: MessagePayload):
 
 
 # ==========================================
-# STT
+# AUDIO PIPELINE ENDPOINTS (STT / TTS)
 # ==========================================
-
 @app.post("/stt")
 async def speech_to_text(request: Request):
     try:
@@ -281,10 +296,6 @@ async def speech_to_text(request: Request):
         return {"text": "", "confidence": 0.0, "error": str(e)}
 
 
-# ==========================================
-# TTS
-# ==========================================
-
 @app.post("/tts")
 async def text_to_speech_endpoint(request: Request):
     try:
@@ -295,7 +306,6 @@ async def text_to_speech_endpoint(request: Request):
         audio_bytes = text_to_speech(text)
         if not audio_bytes:
             return {"fallback": True, "text": text}
-        import base64
         audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
         return {"audio": audio_b64, "fallback": False}
     except Exception as e:
@@ -304,13 +314,12 @@ async def text_to_speech_endpoint(request: Request):
 
 
 # ==========================================
-# ASK
+# CORE WORKFLOW ROUTING ENGINE (ASK)
 # ==========================================
-
 @app.get("/ask")
 async def ask_kiosk(question: str = Query(..., description="Visitor question")):
     global _last_activity_ts
-    _last_activity_ts = datetime.now().timestamp()   # reset timeout on every question
+    _last_activity_ts = datetime.now().timestamp()   # reset timeout threshold tracking
 
     q_clean = question.lower().strip()
     q_clean = q_clean.translate(str.maketrans('', '', string.punctuation)).strip()
@@ -394,7 +403,7 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
         except Exception as e:
             logger.warning("Redis read error: %s", e)
 
-    # --- TIER 3: RAG ---
+    # --- TIER 3: RAG Fallback ---
     logger.info("[CACHE MISS] Running RAG for processed string: '%s'", q_normalized)
     try:
         answer = await generate_rag_kiosk_response(q_normalized, history=message_log[:-1][-6:])
@@ -411,9 +420,8 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
 
 
 # ==========================================
-# VISITOR
+# VISITOR MANAGEMENT ENDPOINTS
 # ==========================================
-
 @app.post("/visitor/unknown")
 async def visitor_unknown():
     global visitor_name_response, active_session
@@ -478,9 +486,8 @@ async def delete_my_data(name: str):
 
 
 # ==========================================
-# FACE
+# BIOMETRICS / FACE REGISTRATION ENDPOINTS
 # ==========================================
-
 class RegisterFacePayload(BaseModel):
     face_id: str = Field(..., description="Unique face id")
     name: str = Field(..., description="Person's name")
@@ -523,10 +530,11 @@ def record_face_visit(face_id: str):
     return {"status": "ok"}
 
 
-# Aliases so old routes still work
+# Backward compatibility aliases
 @app.get("/face/all")
 def get_all_faces_old():
     return get_all_faces_endpoint()
+
 
 @app.post("/face/register")
 async def register_face_old(payload: RegisterFacePayload):
