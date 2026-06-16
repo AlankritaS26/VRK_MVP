@@ -57,12 +57,24 @@ DEEPFACE_MODEL    = "Facenet512"
 DEEPFACE_DETECTOR = "opencv"
 COSINE_THRESHOLD  = 0.30
 
+# ─── Tunable constants ────────────────────────────────────────────────────────
+_COOLDOWN:       float = 120.0  # seconds before same person can retrigger
+_DWELL_REQUIRED: float = 2.0    # seconds face must be present before triggering (passerby filter)
+_GOODBYE_DELAY:  float = 3.0    # seconds face must be ABSENT before ending session
+
 # ─── Global state ─────────────────────────────────────────────────────────────
 _asking_name:        bool  = False
 _last_trigger_ts:    float = 0.0
-_COOLDOWN:           float = 120.0
-_last_known_identity: str  = ""   # keeps name visible during cooldown
-_known_faces_cache:  list  = []   # refreshed after every registration
+_last_known_identity: str  = ""
+_known_faces_cache:  list  = []
+
+# Passerby filter — track how long face has been continuously present
+_face_first_seen_ts: float = 0.0   # when face appeared this time
+_face_present_last:  bool  = False  # was face present in previous frame
+
+# Goodbye detection — track how long face has been absent
+_face_gone_ts:       float = 0.0   # when face disappeared
+_session_active:     bool  = False  # are we in an active session right now
 
 
 # ─── Data classes ─────────────────────────────────────────────────────────────
@@ -219,18 +231,31 @@ def recognize_face(face_crop: np.ndarray, known_faces: list) -> tuple:
     return False, None, None, confidence
 
 
+# ─── Goodbye: end session when face disappears ────────────────────────────────
+
+def _end_session_background():
+    """Called in background thread when face has been gone for _GOODBYE_DELAY seconds."""
+    global _session_active, _last_known_identity, _last_trigger_ts
+    logger.info("[DETECTION] Face gone — ending session")
+    _post("/session/end")
+    _session_active      = False
+    _last_known_identity = ""
+    _last_trigger_ts     = 0.0   # allow fresh trigger for next visitor
+
+
 # ─── Background: unknown visitor flow ─────────────────────────────────────────
 
 def _handle_unknown_visitor(face_crop: np.ndarray):
     """
     Runs in daemon thread.
     Order:
-      1. Poll for name (frontend already showing input via /visitor/unknown)
-      2. Save face to DB first (/face/register)
-      3. Then start session (/session/start) — face_id now exists in DB
-      4. Refresh cache
+      1. Notify backend unknown face detected
+      2. Poll for name (frontend shows input box)
+      3. Save face to DB FIRST (/faces/register)
+      4. Then start session (/session/start) — face_id now exists in DB
+      5. Refresh cache
     """
-    global _asking_name, _known_faces_cache, _last_known_identity, _last_trigger_ts
+    global _asking_name, _known_faces_cache, _last_known_identity, _last_trigger_ts, _session_active
     try:
         r = _post("/visitor/unknown")
         if not r or r.status_code != 200:
@@ -284,11 +309,12 @@ def _handle_unknown_visitor(face_crop: np.ndarray):
             "visit_count":  1,
             "trigger":      "camera",
         })
+        _session_active = True
 
     except Exception as e:
         logger.error(f"[DETECTION] _handle_unknown_visitor error: {e}")
     finally:
-        _last_trigger_ts = time.time() + 60.0  # 60s grace — won't retrigger immediately
+        _last_trigger_ts = time.time() + 60.0  # 60s grace after registration
         _asking_name     = False
 
 
@@ -296,6 +322,7 @@ def _handle_unknown_visitor(face_crop: np.ndarray):
 
 def run_pipeline(frame_data, known_faces: list = None, draw_mesh: bool = False) -> DetectionResult:
     global _asking_name, _last_trigger_ts, _known_faces_cache, _last_known_identity
+    global _face_first_seen_ts, _face_present_last, _face_gone_ts, _session_active
 
     try:
         frame = _decode_frame(frame_data)
@@ -303,22 +330,54 @@ def run_pipeline(frame_data, known_faces: list = None, draw_mesh: bool = False) 
         return DetectionResult(present=False, bbox=None, face_crop=None, error=str(e))
 
     result = detect_presence(frame, draw_mesh=draw_mesh)
+    now    = time.time()
+
+    # ─── Goodbye detection ───────────────────────────────────────────────────
     if not result.present:
+        if _face_present_last:
+            # Face just disappeared — start goodbye timer
+            _face_gone_ts = now
+            logger.info("[DETECTION] Face disappeared — starting goodbye timer")
+
+        elif _session_active and _face_gone_ts > 0 and (now - _face_gone_ts) >= _GOODBYE_DELAY:
+            # Face has been gone long enough — end session
+            _face_gone_ts = 0.0
+            threading.Thread(target=_end_session_background, daemon=True).start()
+
+        _face_present_last  = False
+        _face_first_seen_ts = 0.0
         return result
 
+    # ─── Face IS present ─────────────────────────────────────────────────────
+    _face_gone_ts = 0.0   # reset goodbye timer since face is back
+
+    if not _face_present_last:
+        # Face just appeared — start dwell timer
+        _face_first_seen_ts = now
+        logger.info("[DETECTION] Face appeared — starting dwell timer")
+
+    _face_present_last = True
+
+    # ─── Passerby filter ─────────────────────────────────────────────────────
+    dwell_time = now - _face_first_seen_ts if _face_first_seen_ts > 0 else 0.0
+    if dwell_time < _DWELL_REQUIRED:
+        # Person hasn't been here long enough — show detection but don't trigger
+        result.identity = "..."
+        return result
+
+    # ─── Already asking for name ──────────────────────────────────────────────
     if _asking_name:
         result.identity = "Identifying..."
         return result
 
-    now = time.time()
+    # ─── Cooldown ─────────────────────────────────────────────────────────────
     if now - _last_trigger_ts < _COOLDOWN:
-        # In cooldown — show last known name so screen doesn't blank out
         if _last_known_identity:
             result.identity = _last_known_identity
             result.verified = True
         return result
 
-    # Always use global cache
+    # ─── Recognition ──────────────────────────────────────────────────────────
     verified, name, face_id, confidence = recognize_face(result.face_crop, _known_faces_cache)
     result.verified   = verified
     result.confidence = confidence
@@ -327,6 +386,9 @@ def run_pipeline(frame_data, known_faces: list = None, draw_mesh: bool = False) 
         result.identity      = name
         _last_known_identity = name
         _last_trigger_ts     = now
+        _session_active      = True
+
+        # Increment visit count for returning visitor
         _post("/session/start", params={
             "user_name":    name,
             "face_id":      face_id,
@@ -334,7 +396,10 @@ def run_pipeline(frame_data, known_faces: list = None, draw_mesh: bool = False) 
             "visit_count":  1,
             "trigger":      "camera",
         })
+        # Tell DB to increment visit count
+        _post("/faces/visit", params={"face_id": face_id})
         logger.info(f"[DETECTION] Returning visitor: {name} (sim={confidence})")
+
     else:
         _last_known_identity = ""
         _last_trigger_ts     = now

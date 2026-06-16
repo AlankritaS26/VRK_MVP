@@ -11,6 +11,7 @@ import shutil
 import logging
 import hashlib
 import string
+import asyncio
 from pathlib import Path
 from datetime import datetime
 from typing import List
@@ -29,7 +30,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from backend.database import (
     init_db,
     save_session, end_session, save_interaction,
-    delete_face_by_name,
+    delete_face_by_name, update_face_seen,
     get_admission_fee_by_branch, get_admission_requirements,
 )
 from backend.llm import initialize_rag_knowledge_base, generate_rag_kiosk_response
@@ -46,14 +47,14 @@ logger = logging.getLogger("RNSIT_Kiosk")
 
 ALLOWED_ORIGINS: List[str] = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 MAX_QUERY_LENGTH: int = 500
+SESSION_TIMEOUT_SECONDS: int = 120   # auto-end session after 2 min no activity
 
-# Dictionary mapping common spoken/STT typos to correct college domain terms
 DOMAINS_CORRECTIONS = {
-    "pricipal": "principal",
+    "pricipal":  "principal",
     "prinsipal": "principal",
-    "libary": "library",
-    "placment": "placement",
-    "fees": "fee",
+    "libary":    "library",
+    "placment":  "placement",
+    "fees":      "fee",
 }
 
 app = FastAPI(title="RNSIT Digital Receptionist")
@@ -79,6 +80,7 @@ except Exception as e:
 active_session: dict | None = None
 message_log: list[dict] = []
 visitor_name_response: dict = {"ready": False, "name": "", "save": True}
+_last_activity_ts: float = 0.0   # updated on every /ask call
 
 init_db()
 
@@ -95,6 +97,29 @@ async def startup_event():
         logger.info("[SYSTEM] RAG vector cache loaded.")
     except Exception as e:
         logger.error("[SYSTEM] RAG startup failed: %s", e)
+    # Start background session timeout checker
+    asyncio.create_task(_session_timeout_loop())
+
+
+# ==========================================
+# SESSION TIMEOUT BACKGROUND TASK
+# ==========================================
+
+async def _session_timeout_loop():
+    """Every 30s, check if session has been idle for SESSION_TIMEOUT_SECONDS."""
+    global active_session, _last_activity_ts
+    while True:
+        await asyncio.sleep(30)
+        if active_session and _last_activity_ts > 0:
+            idle = datetime.now().timestamp() - _last_activity_ts
+            if idle >= SESSION_TIMEOUT_SECONDS:
+                logger.info(f"[SESSION] Timeout after {idle:.0f}s idle — ending session")
+                sid = active_session.get("session_id")
+                if sid:
+                    end_session(sid)
+                active_session    = None
+                _last_activity_ts = 0.0
+                await manager.broadcast({"type": "session_end", "session_id": sid, "reason": "timeout"})
 
 
 # ==========================================
@@ -170,7 +195,7 @@ async def start_session(
     face_id: str = "",
     session_id: str = "",
 ):
-    global active_session, message_log
+    global active_session, message_log, _last_activity_ts
     final_session_id = face_id or session_id or str(uuid.uuid4())
 
     active_session = {
@@ -182,10 +207,9 @@ async def start_session(
         "trigger":      trigger,
         "asking_name":  False,
     }
-    message_log = []
+    message_log       = []
+    _last_activity_ts = datetime.now().timestamp()
 
-    # Only pass face_id to DB if it's non-empty — avoids FK constraint error
-    # when face was not registered (Guest sessions)
     db_face_id = face_id.strip() if face_id and face_id.strip() else None
     save_session(final_session_id, db_face_id, user_name, is_returning, visit_count)
     await manager.broadcast({"type": "session_start", "session": active_session})
@@ -194,11 +218,12 @@ async def start_session(
 
 @app.post("/session/end")
 async def end_session_endpoint(session_id: str = None):
-    global active_session
+    global active_session, _last_activity_ts
     sid = session_id or (active_session["session_id"] if active_session else None)
     if sid:
         end_session(sid)
-    active_session = None
+    active_session    = None
+    _last_activity_ts = 0.0
     await manager.broadcast({"type": "session_end", "session_id": sid})
     return {"status": "success"}
 
@@ -238,8 +263,9 @@ async def post_message(payload: MessagePayload):
     await manager.broadcast({"type": "message", **entry})
     return {"status": "ok"}
 
+
 # ==========================================
-# STT ENDPOINT
+# STT
 # ==========================================
 
 @app.post("/stt")
@@ -256,7 +282,7 @@ async def speech_to_text(request: Request):
 
 
 # ==========================================
-# TTS ENDPOINT
+# TTS
 # ==========================================
 
 @app.post("/tts")
@@ -275,37 +301,35 @@ async def text_to_speech_endpoint(request: Request):
     except Exception as e:
         logger.error(f"[TTS] Endpoint error: {e}")
         return {"fallback": True, "text": ""}
-    
+
+
 # ==========================================
 # ASK
 # ==========================================
 
 @app.get("/ask")
 async def ask_kiosk(question: str = Query(..., description="Visitor question")):
-    # 1. TEXT PREPROCESSING: Clean punctuation and casing (Fixes Cache Misses from spoken '?')
+    global _last_activity_ts
+    _last_activity_ts = datetime.now().timestamp()   # reset timeout on every question
+
     q_clean = question.lower().strip()
     q_clean = q_clean.translate(str.maketrans('', '', string.punctuation)).strip()
 
-    # 2. TYPO NORMALIZATION: Intercept phonetic mistakes before vector or SQL tier execution
-    words = q_clean.split()
+    words          = q_clean.split()
     corrected_words = [DOMAINS_CORRECTIONS.get(w, w) for w in words]
-    q_normalized = " ".join(corrected_words)
+    q_normalized   = " ".join(corrected_words)
 
-    sid = active_session["session_id"] if active_session else "unknown"
+    sid          = active_session["session_id"] if active_session else "unknown"
     visitor_name = (active_session.get("user_name") or "there") if active_session else "there"
 
-    # Log visitor question to session history and broadcast to WS clients
     visitor_entry = _log_message(question, "visitor")
     await manager.broadcast({"type": "message", **visitor_entry})
 
     async def _respond(answer: str, source: str = "") -> dict:
-        """Save to DB, log to session history, broadcast, and return response."""
         try:
             save_interaction(sid, question, answer)
         except Exception as exc:
-            # Prevents foreign key constraint violations from breaking user responses
-            logger.error("[DATABASE ERROR] Failed to log interaction cleanly: %s", exc)
-
+            logger.error("[DATABASE ERROR] Failed to log interaction: %s", exc)
         kiosk_entry = _log_message(answer, "kiosk")
         await manager.broadcast({"type": "message", **kiosk_entry})
         result = {"question": question, "answer": answer}
@@ -313,7 +337,7 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
             result["source"] = source
         return result
 
-    # --- TIER 1: SQL — Fees ---
+    # --- TIER 1: Fees ---
     if any(kw in q_normalized for kw in ["fee", "cost", "price", "instalment", "payment"]):
         branch_keyword = next(
             (b for b in ["cse", "ai", "data", "cyber", "ece", "vlsi", "eee", "mech", "civil"] if b in q_normalized),
@@ -339,18 +363,18 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
             answer = "Management fees range from ₹1,10,000 (Civil) to ₹7,50,000/year (Core CSE). Name a specific branch for exact figures!"
         return await _respond(answer)
 
-    # --- TIER 1: SQL — Documents ---
+    # --- TIER 1: Documents ---
     if any(kw in q_normalized for kw in ["document", "documents", "certificate", "paperwork", "bring", "marks card"]):
         quota = "KCET" if any(k in q_normalized for k in ["cet", "kea", "govt"]) else "Management"
-        docs = get_admission_requirements(quota)
+        docs  = get_admission_requirements(quota)
         if docs:
             doc_list = "\n".join(f"- {doc}" for doc in docs)
-            answer = f"For {quota} Quota admissions, bring originals and photocopies of:\n{doc_list}"
+            answer   = f"For {quota} Quota admissions, bring originals and photocopies of:\n{doc_list}"
         else:
             answer = "Please bring your 10th and 12th Marks Cards, Transfer Certificate, Entrance Exam Rank Card, and ID copies to the Admin Block."
         return await _respond(answer)
 
-    # --- TIER 2: Static greetings ---
+    # --- TIER 2: Greetings ---
     short_greetings = {
         "hi":  f"Hi {visitor_name}! Welcome to RNSIT. How can I help you today?",
         "hey": f"Hey {visitor_name}! Welcome to RNS Institute of Technology. What can I help with?",
@@ -359,7 +383,7 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
     if q_normalized in short_greetings:
         return await _respond(short_greetings[q_normalized])
 
-    # --- PERFORMANCE LAYER: Redis cache ---
+    # --- Redis cache ---
     cache_key = f"kiosk:cache:{hashlib.md5(q_normalized.encode()).hexdigest()}"
     if redis_client:
         try:
@@ -370,10 +394,9 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
         except Exception as e:
             logger.warning("Redis read error: %s", e)
 
-    # --- TIER 3: RAG / Llama 3.1 ---
-    logger.info("[CACHE MISS] Running RAG for: '%s'", question)
+    # --- TIER 3: RAG ---
+    logger.info("[CACHE MISS] Running RAG for processed string: '%s'", q_normalized)
     try:
-        # Passing the corrected string ensures subword tokenization doesn't shatter embeddings
         answer = await generate_rag_kiosk_response(q_normalized, history=message_log[:-1][-6:])
         if redis_client and answer:
             try:
@@ -394,7 +417,6 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
 @app.post("/visitor/unknown")
 async def visitor_unknown():
     global visitor_name_response, active_session
-    # Only reset if NOT already waiting on a submitted name
     if not visitor_name_response.get("ready"):
         visitor_name_response = {"ready": False, "name": "", "save": True}
 
@@ -420,7 +442,7 @@ async def submit_name(name: str = "Guest", save: bool = True):
     visitor_name_response = {"ready": True, "name": name, "save": save}
     if active_session:
         active_session["asking_name"] = False
-        active_session["user_name"] = name
+        active_session["user_name"]   = name
     logger.info(f"[VISITOR] Name submitted: '{name}' save={save}")
     return {"status": "ok"}
 
@@ -456,7 +478,7 @@ async def delete_my_data(name: str):
 
 
 # ==========================================
-# FACE  — routes use /faces/ prefix
+# FACE
 # ==========================================
 
 class RegisterFacePayload(BaseModel):
@@ -493,7 +515,15 @@ async def register_face(payload: RegisterFacePayload):
     return {"status": "ok", "face_id": payload.face_id}
 
 
-# Keep old routes as aliases so nothing else breaks
+@app.post("/faces/visit")
+def record_face_visit(face_id: str):
+    """Increment visit count for a returning visitor."""
+    update_face_seen(face_id)
+    logger.info(f"[FACE] Visit count incremented for face_id={face_id}")
+    return {"status": "ok"}
+
+
+# Aliases so old routes still work
 @app.get("/face/all")
 def get_all_faces_old():
     return get_all_faces_endpoint()
