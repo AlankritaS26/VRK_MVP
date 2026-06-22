@@ -11,3 +11,4 @@ en_US-amy-low.onnx.json
 node_modules/
 frontend/node_modules/
 frontend/build/
+venv/
