@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 
 const BACKEND = process.env.REACT_APP_BACKEND_URL || 'http://127.0.0.1:8000';
+const WS_BACKEND = BACKEND.replace('http', 'ws');
 
 export default function WelcomeScreen({ session, messages, setMessages, askingName }) {
   const scrollRef      = useRef(null);
@@ -8,7 +9,11 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const isMounted      = useRef(true);
   const isSpeaking     = useRef(false);
   const isListening    = useRef(false);
-  const lastTranscript = useRef('');
+  const wsRef          = useRef(null);
+  const mediaRecRef    = useRef(null);
+  const analyserRef    = useRef(null);
+  const animFrameRef   = useRef(null);
+  const canvasRef      = useRef(null);
 
   const [name,       setName]       = useState('');
   const [saveData,   setSaveData]   = useState(true);
@@ -18,6 +23,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const [deleted,    setDeleted]    = useState(false);
   const [liveText,   setLiveText]   = useState('');
   const [listening,  setListening]  = useState(false);
+  const [status,     setStatus]     = useState('ready'); // ready | connecting | listening | processing | speaking
 
   const visitorName = session?.user_name    || 'Guest';
   const isReturning = session?.is_returning || false;
@@ -36,7 +42,10 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
   useEffect(() => {
     isMounted.current = true;
-    return () => { isMounted.current = false; };
+    return () => {
+      isMounted.current = false;
+      stopListening();
+    };
   }, []);
 
   useEffect(() => {
@@ -53,85 +62,201 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     }]);
   }, [setMessages]);
 
+  // ── WAVEFORM ANIMATION ──────────────────────────────────────────────────
+  const drawWaveform = useCallback(() => {
+    const canvas = canvasRef.current;
+    const analyser = analyserRef.current;
+    if (!canvas || !analyser) return;
+
+    const ctx = canvas.getContext('2d');
+    const bufferLength = analyser.frequencyBinCount;
+    const dataArray = new Uint8Array(bufferLength);
+
+    const draw = () => {
+      animFrameRef.current = requestAnimationFrame(draw);
+      analyser.getByteFrequencyData(dataArray);
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      const barWidth = 3;
+      const gap = 2;
+      const bars = Math.floor(canvas.width / (barWidth + gap));
+      const step = Math.floor(bufferLength / bars);
+
+      for (let i = 0; i < bars; i++) {
+        const value = dataArray[i * step] / 255;
+        const barHeight = Math.max(4, value * canvas.height * 0.9);
+        const x = i * (barWidth + gap);
+        const y = (canvas.height - barHeight) / 2;
+
+        // Jarvis blue gradient
+        const gradient = ctx.createLinearGradient(0, y, 0, y + barHeight);
+        gradient.addColorStop(0, `rgba(100, 200, 255, ${0.4 + value * 0.6})`);
+        gradient.addColorStop(1, `rgba(26, 35, 126, ${0.4 + value * 0.6})`);
+
+        ctx.fillStyle = gradient;
+        ctx.beginPath();
+        ctx.roundRect(x, y, barWidth, barHeight, 2);
+        ctx.fill();
+      }
+    };
+
+    draw();
+  }, []);
+
+  const stopWaveform = useCallback(() => {
+    if (animFrameRef.current) {
+      cancelAnimationFrame(animFrameRef.current);
+      animFrameRef.current = null;
+    }
+    const canvas = canvasRef.current;
+    if (canvas) {
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+    }
+  }, []);
+
+  // ── STT via WebSocket ───────────────────────────────────────────────────
+  const stopListening = useCallback(() => {
+    if (mediaRecRef.current && mediaRecRef.current.state !== 'inactive') {
+      mediaRecRef.current.stop();
+    }
+    if (wsRef.current) {
+      try { wsRef.current.send('stop'); } catch(e) {}
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+    isListening.current = false;
+    if (isMounted.current) {
+      setListening(false);
+      setStatus('ready');
+    }
+    stopWaveform();
+  }, [stopWaveform]);
+
   const startListening = useCallback(() => {
     if (!isMounted.current) return;
     if (isListening.current) return;
     if (isSpeaking.current) return;
+    if (askingName) return;
 
     isListening.current = true;
     setListening(true);
     setLiveText('');
+    setStatus('connecting');
 
+    // Connect WebSocket
+    const ws = new WebSocket(`${WS_BACKEND}/ws/stt`);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      console.log('[WS] Connected to STT');
+    };
+
+    ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+
+      if (data.type === 'ready') {
+        // Pipeline ready — start mic
+        setStatus('listening');
+        startMic(ws);
+      }
+
+      else if (data.type === 'partial') {
+        // Live text while speaking
+        if (isMounted.current) setLiveText(data.text);
+      }
+
+      else if (data.type === 'final') {
+        // Final transcript — send to backend
+        const heard = data.text.trim();
+        if (heard && heard.length > 1 && !isSpeaking.current) {
+          console.log('[STT] Final:', heard);
+          if (isMounted.current) {
+            setLiveText(heard);
+            setStatus('processing');
+          }
+          sendToBackend(heard);
+        }
+      }
+
+      else if (data.type === 'error') {
+        console.error('[STT] Error:', data.message);
+        stopListening();
+        setTimeout(startListening, 1000);
+      }
+    };
+
+    ws.onclose = () => {
+      console.log('[WS] Disconnected');
+      if (isListening.current) {
+        isListening.current = false;
+        if (isMounted.current) {
+          setListening(false);
+          setStatus('ready');
+        }
+      }
+    };
+
+    ws.onerror = (e) => {
+      console.error('[WS] Error:', e);
+      stopListening();
+    };
+
+  }, [askingName, stopListening]);
+
+  const startMic = useCallback((ws) => {
     navigator.mediaDevices.getUserMedia({
       audio: {
         noiseSuppression: true,
         echoCancellation: true,
-        autoGainControl: true
+        autoGainControl: true,
+        sampleRate: 16000
       }
     }).then(stream => {
-      const audioChunks = [];
-      const mediaRecorder = new MediaRecorder(stream);
+      // Waveform setup
+      const audioCtx = new AudioContext();
+      const source = audioCtx.createMediaStreamSource(stream);
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 256;
+      source.connect(analyser);
+      analyserRef.current = analyser;
+      drawWaveform();
 
-      mediaRecorder.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) audioChunks.push(e.data);
-      };
+      // MediaRecorder — send chunks every 250ms
+      const recorder = new MediaRecorder(stream, {
+        mimeType: 'audio/webm;codecs=opus'
+      });
+      mediaRecRef.current = recorder;
 
-      mediaRecorder.onstop = async () => {
-        stream.getTracks().forEach(track => track.stop());
-        isListening.current = false;
-        if (isMounted.current) setListening(false);
-
-        console.log('[STT] chunks collected:', audioChunks.length);
-
-        if (audioChunks.length === 0) {
-          if (!isSpeaking.current && isMounted.current) setTimeout(startListening, 400);
-          return;
-        }
-
-        const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
-        console.log('[STT] blob size:', audioBlob.size);
-        const arrayBuffer = await audioBlob.arrayBuffer();
-        const audioBytes = new Uint8Array(arrayBuffer);
-
-        try {
-          const response = await fetch(BACKEND + '/stt', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/octet-stream' },
-            body: audioBytes
+      recorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0 && ws.readyState === WebSocket.OPEN) {
+          e.data.arrayBuffer().then(buf => {
+            ws.send(buf);
           });
-
-          const result = await response.json();
-          console.log('[STT WHISPER]', result);
-          const heard = (result.text || '').trim();
-
-          if (heard && heard.length > 1 && !isSpeaking.current) {
-            if (isMounted.current) setLiveText(heard);
-            sendToBackend(heard);
-          } else {
-            if (!isSpeaking.current && isMounted.current) setTimeout(startListening, 400);
-          }
-        } catch (err) {
-          console.error('[STT] fetch error:', err);
-          if (!isSpeaking.current && isMounted.current) setTimeout(startListening, 400);
         }
       };
 
-      // start(100) fires ondataavailable every 100ms — ensures chunks are collected
-      mediaRecorder.start(100);
-      setTimeout(() => {
-        if (mediaRecorder.state !== 'inactive') mediaRecorder.stop();
-      }, 5000);
+      recorder.onstop = () => {
+        stream.getTracks().forEach(t => t.stop());
+        audioCtx.close();
+        analyserRef.current = null;
+        stopWaveform();
+      };
+
+      // Send chunks every 250ms for smooth real-time experience
+      recorder.start(250);
 
     }).catch(err => {
       console.error('[MIC] Error:', err);
-      isListening.current = false;
-      if (isMounted.current) setListening(false);
+      stopListening();
     });
-  }, []);
+  }, [drawWaveform, stopWaveform, stopListening]);
 
+  // ── SEND TO BACKEND ─────────────────────────────────────────────────────
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   const sendToBackend = useCallback(async (text) => {
     if (!text) return;
-    lastTranscript.current = '';
     setLiveText('');
     const sid = session?.session_id || 'guest';
     addMessage(text, 'user');
@@ -145,6 +270,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       } catch(e) {}
       return;
     }
+
     try {
       const [, askRes] = await Promise.all([
         fetch(BACKEND + '/message', {
@@ -166,13 +292,17 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     } catch(e) {
       console.error('[sendToBackend]', e);
       isSpeaking.current = false;
+      setStatus('listening');
       if (isMounted.current) startListening();
     }
   }, [session, addMessage]);
 
+  // ── SPEAK ───────────────────────────────────────────────────────────────
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   const speak = useCallback((text) => {
     window.speechSynthesis.cancel();
     isSpeaking.current = true;
+    setStatus('speaking');
     const utter  = new SpeechSynthesisUtterance(text);
     utter.lang   = 'en-US';
     utter.rate   = 1.0;
@@ -190,7 +320,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
   useEffect(() => {
     if (askingName) return;
-    const t = setTimeout(startListening, 300);
+    const t = setTimeout(startListening, 500);
     return () => clearTimeout(t);
   }, [askingName, startListening]);
 
@@ -213,39 +343,36 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     } catch(e) { console.error(e); }
   };
 
+  // Status label
+  const statusLabel = {
+    ready:       'Microphone ready',
+    connecting:  'Connecting...',
+    listening:   'Listening — speak your question',
+    processing:  'Processing...',
+    speaking:    'Speaking...'
+  }[status] || 'Ready';
+
+  const statusColor = {
+    ready:       '#ffb300',
+    connecting:  '#42a5f5',
+    listening:   '#43a047',
+    processing:  '#7e57c2',
+    speaking:    '#ef5350'
+  }[status] || '#ffb300';
+
   const inputStyle = {
-    width: '100%',
-    padding: '12px 16px',
-    border: '1.5px solid #c5cae9',
-    borderRadius: '8px',
-    fontSize: '15px',
-    boxSizing: 'border-box',
-    outline: 'none',
-    color: '#1a237e',
-    background: '#f8f9ff',
-    transition: 'border 0.2s'
+    width: '100%', padding: '12px 16px', border: '1.5px solid #c5cae9',
+    borderRadius: '8px', fontSize: '15px', boxSizing: 'border-box',
+    outline: 'none', color: '#1a237e', background: '#f8f9ff', transition: 'border 0.2s'
   };
-
   const btnPrimary = {
-    padding: '11px 24px',
-    border: 'none',
-    borderRadius: '8px',
-    background: '#1a237e',
-    color: '#fff',
-    cursor: 'pointer',
-    fontSize: '14px',
-    fontWeight: '600',
-    letterSpacing: '0.3px'
+    padding: '11px 24px', border: 'none', borderRadius: '8px',
+    background: '#1a237e', color: '#fff', cursor: 'pointer',
+    fontSize: '14px', fontWeight: '600', letterSpacing: '0.3px'
   };
-
   const btnSecondary = {
-    padding: '11px 24px',
-    border: '1.5px solid #c5cae9',
-    borderRadius: '8px',
-    background: '#fff',
-    color: '#555',
-    cursor: 'pointer',
-    fontSize: '14px'
+    padding: '11px 24px', border: '1.5px solid #c5cae9', borderRadius: '8px',
+    background: '#fff', color: '#555', cursor: 'pointer', fontSize: '14px'
   };
 
   return (
@@ -347,16 +474,12 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
                     <div style={{ fontSize: '13px', color: '#888' }}>We do not recognize you yet</div>
                   </div>
                 </div>
-
                 <div style={{ marginBottom: '16px' }}>
                   <label style={{ fontSize: '13px', fontWeight: '600', color: '#444', display: 'block', marginBottom: '6px' }}>Your Full Name</label>
-                  <input ref={inputRef} style={inputStyle}
-                    placeholder="e.g. Akshatha A"
+                  <input ref={inputRef} style={inputStyle} placeholder="e.g. Akshatha A"
                     value={name} onChange={e => setName(e.target.value)}
                     onKeyDown={e => e.key === 'Enter' && handleSubmitName()} autoFocus />
                 </div>
-
-                {/* Toggle */}
                 <div style={{ background: '#f8f9ff', border: '1.5px solid #e8eaf6', borderRadius: '10px', padding: '14px 16px', marginBottom: '20px' }}>
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                     <div>
@@ -368,7 +491,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
                     </div>
                   </div>
                 </div>
-
                 <div style={{ display: 'flex', gap: '10px' }}>
                   <button onClick={() => handleSubmitName('Guest', false)} style={{ ...btnSecondary, flex: 1 }}>Continue as Guest</button>
                   <button onClick={() => handleSubmitName()} style={{ ...btnPrimary, flex: 1 }}>{saveData ? 'Register & Continue' : 'Continue'}</button>
@@ -382,49 +504,65 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       {/* Chat Area */}
       <div ref={scrollRef} style={{ flex: '1 1 0', overflowY: 'auto', minHeight: 0, padding: '28px 32px', display: 'flex', flexDirection: 'column', gap: '16px', maxWidth: '900px', width: '100%', margin: '0 auto', alignSelf: 'stretch' }}>
         {messages.length === 0 && !liveText ? (
-          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '16px', paddingTop: '60px' }}>
-            <div style={{ width: '72px', height: '72px', borderRadius: '50%', background: '#e8eaf6', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-              <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#1a237e" strokeWidth="1.5">
-                <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
-                <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
-                <line x1="12" y1="19" x2="12" y2="23"/>
-                <line x1="8" y1="23" x2="16" y2="23"/>
-              </svg>
+          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '16px', paddingTop: '40px' }}>
+
+            {/* Jarvis-style waveform */}
+            <div style={{ position: 'relative', width: '200px', height: '80px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+              {listening ? (
+                <canvas ref={canvasRef} width={200} height={80}
+                  style={{ borderRadius: '12px', background: 'rgba(26,35,126,0.04)' }} />
+              ) : (
+                <div style={{ width: '72px', height: '72px', borderRadius: '50%', background: '#e8eaf6', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#1a237e" strokeWidth="1.5">
+                    <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+                    <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                    <line x1="12" y1="19" x2="12" y2="23"/>
+                    <line x1="8" y1="23" x2="16" y2="23"/>
+                  </svg>
+                </div>
+              )}
             </div>
-            <div style={{ fontSize: '17px', fontWeight: '700', color: '#1a237e' }}>{listening ? 'Listening...' : 'Ready to assist you'}</div>
+
+            <div style={{ fontSize: '17px', fontWeight: '700', color: '#1a237e' }}>
+              {status === 'connecting'  && 'Connecting...'}
+              {status === 'listening'   && 'Listening...'}
+              {status === 'processing'  && 'Processing...'}
+              {status === 'speaking'    && 'Speaking...'}
+              {status === 'ready'       && 'Ready to assist you'}
+            </div>
             <div style={{ fontSize: '14px', color: '#aaa', textAlign: 'center', maxWidth: '300px', lineHeight: '1.6' }}>
-              {listening ? 'Please speak your question clearly' : 'Ask me anything about RNSIT — departments, facilities, timings, and more'}
+              {status === 'listening' ? 'Please speak your question clearly' : 'Ask me anything about RNSIT'}
             </div>
-            {listening && (
-              <div style={{ display: 'flex', gap: '6px', alignItems: 'center', marginTop: '8px' }}>
-                {[0,1,2,3,4].map(i => (
-                  <div key={i} style={{ width: '4px', borderRadius: '2px', background: '#1a237e', animation: 'wave 1.2s infinite ease-in-out', animationDelay: i * 0.12 + 's', height: '20px' }} />
-                ))}
-              </div>
-            )}
           </div>
         ) : (
           <>
+            {/* Waveform above chat when listening */}
+            {listening && (
+              <div style={{ display: 'flex', justifyContent: 'center', marginBottom: '8px' }}>
+                <canvas ref={canvasRef} width={300} height={50}
+                  style={{ borderRadius: '8px', background: 'rgba(26,35,126,0.04)' }} />
+              </div>
+            )}
+
             {messages.map((msg, i) => (
               <div key={i} style={{ display: 'flex', flexDirection: 'column', alignItems: msg.speaker === 'kiosk' ? 'flex-start' : 'flex-end' }}>
                 <div style={{ fontSize: '11px', color: '#bbb', marginBottom: '4px', paddingLeft: msg.speaker === 'kiosk' ? '4px' : 0, paddingRight: msg.speaker !== 'kiosk' ? '4px' : 0, fontWeight: '500' }}>
                   {msg.speaker === 'kiosk' ? 'RNSIT Kiosk' : visitorName} &nbsp;·&nbsp; {msg.timestamp}
                 </div>
                 <div style={{
-                  maxWidth: '60%',
-                  padding: '14px 18px',
+                  maxWidth: '60%', padding: '14px 18px',
                   borderRadius: msg.speaker === 'kiosk' ? '4px 18px 18px 18px' : '18px 4px 18px 18px',
                   background: msg.speaker === 'kiosk' ? '#ffffff' : '#1a237e',
                   color: msg.speaker === 'kiosk' ? '#222' : '#ffffff',
                   border: msg.speaker === 'kiosk' ? '1.5px solid #e8eaf6' : 'none',
-                  fontSize: '14px',
-                  lineHeight: '1.65',
+                  fontSize: '14px', lineHeight: '1.65',
                   boxShadow: msg.speaker === 'kiosk' ? '0 2px 8px rgba(0,0,0,0.06)' : '0 2px 8px rgba(26,35,126,0.18)'
                 }}>
                   {msg.text}
                 </div>
               </div>
             ))}
+
             {liveText && (
               <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
                 <div style={{ fontSize: '11px', color: '#bbb', marginBottom: '4px', paddingRight: '4px' }}>{visitorName} (speaking...)</div>
@@ -440,15 +578,14 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       {/* Footer */}
       <footer style={{ background: '#ffffff', borderTop: '1.5px solid #e8eaf6', padding: '12px 32px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', boxShadow: '0 -2px 8px rgba(26,35,126,0.05)' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-          <div style={{ width: '10px', height: '10px', borderRadius: '50%', background: listening ? '#43a047' : '#ffb300', transition: 'background 0.3s', animation: listening ? 'pulse 1.5s infinite' : 'none' }} />
-          <span style={{ fontSize: '13px', color: '#555', fontWeight: '500' }}>{listening ? 'Listening — please speak your question' : 'Microphone ready'}</span>
+          <div style={{ width: '10px', height: '10px', borderRadius: '50%', background: statusColor, transition: 'background 0.3s', animation: listening ? 'pulse 1.5s infinite' : 'none' }} />
+          <span style={{ fontSize: '13px', color: '#555', fontWeight: '500' }}>{statusLabel}</span>
         </div>
         <div style={{ fontSize: '12px', color: '#bbb' }}>RNSIT Digital Receptionist &nbsp;·&nbsp; Bengaluru — 560098</div>
       </footer>
 
       <style>{`
         @keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:0.5;transform:scale(1.4)} }
-        @keyframes wave { 0%,100%{height:8px} 50%{height:24px} }
         * { box-sizing: border-box; margin: 0; padding: 0; }
         input:focus { border-color: #1a237e !important; box-shadow: 0 0 0 3px rgba(26,35,126,0.1); }
         ::-webkit-scrollbar { width: 6px; }

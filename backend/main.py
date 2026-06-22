@@ -36,7 +36,7 @@ from backend.database import (
     get_admission_fee_by_branch, get_admission_requirements,
 )
 from backend.llm import initialize_rag_knowledge_base, generate_rag_kiosk_response, close_llm_client
-from backend.stt import transcribe_audio
+from backend.stt import STTPipeline, transcribe_audio
 from backend.tts import text_to_speech
 
 load_dotenv()
@@ -279,10 +279,79 @@ async def post_message(payload: MessagePayload):
     await manager.broadcast({"type": "message", **entry})
     return {"status": "ok"}
 
-
 # ==========================================
 # AUDIO PIPELINE ENDPOINTS (STT / TTS)
 # ==========================================
+
+@app.websocket("/ws/stt")
+async def stt_websocket_endpoint(ws: WebSocket):
+    await ws.accept()
+    print("[WS/STT] Browser connected")
+
+    loop = asyncio.get_event_loop()
+    partial_queue = asyncio.Queue()
+    final_queue = asyncio.Queue()
+
+    def on_partial(text: str):
+        asyncio.run_coroutine_threadsafe(partial_queue.put(text), loop)
+
+    def on_final(text: str):
+        asyncio.run_coroutine_threadsafe(final_queue.put(text), loop)
+
+    pipeline = STTPipeline(on_partial=on_partial, on_final=on_final)
+    pipeline.start()
+
+    for _ in range(150):
+        if pipeline.is_ready():
+            break
+        await asyncio.sleep(0.1)
+
+    if not pipeline.is_ready():
+        await ws.send_json({"type": "error", "message": "STT failed to initialize"})
+        await ws.close()
+        return
+
+    await ws.send_json({"type": "ready"})
+
+    async def send_partials():
+        while True:
+            text = await partial_queue.get()
+            try:
+                await ws.send_json({"type": "partial", "text": text})
+            except:
+                break
+
+    async def send_finals():
+        while True:
+            text = await final_queue.get()
+            try:
+                await ws.send_json({"type": "final", "text": text})
+            except:
+                break
+
+    partial_task = asyncio.create_task(send_partials())
+    final_task = asyncio.create_task(send_finals())
+
+    try:
+        while True:
+            message = await ws.receive()
+            if message["type"] == "websocket.disconnect":
+                break
+            if "bytes" in message and message["bytes"]:
+                pipeline.feed(message["bytes"])
+            elif "text" in message and message["text"] == "stop":
+                break
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"[WS/STT] Error: {e}")
+    finally:
+        partial_task.cancel()
+        final_task.cancel()
+        pipeline.stop()
+        print("[WS/STT] Connection closed")
+
+
 @app.post("/stt")
 async def speech_to_text(request: Request):
     try:
@@ -311,7 +380,6 @@ async def text_to_speech_endpoint(request: Request):
     except Exception as e:
         logger.error(f"[TTS] Endpoint error: {e}")
         return {"fallback": True, "text": ""}
-
 
 # ==========================================
 # CORE WORKFLOW ROUTING ENGINE (ASK)

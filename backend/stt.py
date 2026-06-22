@@ -1,118 +1,180 @@
 """
-STT Pipeline using RealtimeSTT
-- Uses faster-whisper as the transcription engine
-- Small model for accuracy, tiny for real-time preview
-- Built-in VAD so it stops when you stop talking
-- Streams partial text while you speak
+STT Pipeline — RealtimeSTT with feed_audio()
+Browser sends audio chunks via WebSocket → backend feeds to RealtimeSTT
+RealtimeSTT handles VAD, silence detection, real-time text, final transcript
+No mic needed on backend — works with Scenario B
 """
 
-import asyncio
 import threading
-from typing import Callable, Optional
-from RealtimeSTT import AudioToTextRecorder
+import time
+from typing import Optional, Callable
 
-# ─── RECORDER INSTANCE ───────────────────────────────────────────────────────
-# We create one global recorder and reuse it
-# This avoids reloading the model on every request
-
-recorder: Optional[AudioToTextRecorder] = None
-recorder_lock = threading.Lock()
-
-def get_recorder() -> AudioToTextRecorder:
-    global recorder
-    if recorder is None:
-        print("[STT] Initializing RealtimeSTT recorder...")
-        recorder = AudioToTextRecorder(
-            # Main transcription model — better accuracy
-            model="small",
-            transcription_engine="faster_whisper",
-
-            # Real-time preview model — fast live text
-            enable_realtime_transcription=True,
-            realtime_model_type="tiny",
-
-            # Language
-            language="en",
-
-            # VAD settings — stops recording when you stop talking
-            silero_sensitivity=0.4,
-            webrtc_sensitivity=2,
-            post_speech_silence_duration=0.6,  # 0.6s silence = end of speech
-            min_length_of_recording=0.3,       # ignore sounds under 0.3s
-            min_gap_between_recordings=0.1,
-
-            # Campus vocabulary bias
-            initial_prompt=(
-                "RNSIT, RNS Institute of Technology, Channasandra, Bengaluru, "
-                "USN, SGPA, CGPA, CIE, SEE, CSE, ECE, EEE, ISE, AI, ML, "
-                "fees, hostel, canteen, library, admin block, principal, HOD"
-            ),
-
-            # Performance
-            beam_size=5,
-            beam_size_realtime=1,   # tiny model uses beam 1 for speed
-            no_log_file=True,
-            spinner=False,
-        )
-        print("[STT] RealtimeSTT ready.")
-    return recorder
-
-
-def transcribe_once(
-    on_realtime_text: Optional[Callable[[str], None]] = None
-) -> dict:
+class STTPipeline:
     """
-    Records one utterance and returns the final transcript.
-    Calls on_realtime_text callback with partial text while speaking.
+    One instance per WebSocket connection.
+    Browser feeds audio chunks, we stream partial + final text back.
     """
-    import time
-    start = time.time()
 
-    rec = get_recorder()
+    def __init__(
+        self,
+        on_partial: Callable[[str], None],
+        on_final: Callable[[str], None]
+    ):
+        self.on_partial = on_partial
+        self.on_final = on_final
+        self.recorder = None
+        self._ready = False
+        self._thread = None
 
-    # Set real-time callback if provided
-    if on_realtime_text:
-        rec.on_realtime_transcription_update = on_realtime_text
+    def start(self):
+        """Initialize RealtimeSTT in a background thread."""
+        self._thread = threading.Thread(target=self._init_and_run, daemon=True)
+        self._thread.start()
 
-    # This blocks until the user stops speaking and returns final text
-    text = rec.text()
-    text = text.strip()
+    def _init_and_run(self):
+        try:
+            from RealtimeSTT import AudioToTextRecorder
+            print("[STT] Initializing RealtimeSTT pipeline...")
 
-    latency_ms = int((time.time() - start) * 1000)
-    print(f"[STT] '{text}' | {latency_ms}ms")
+            self.recorder = AudioToTextRecorder(
+                # Main model — best accuracy on CPU without GPU
+                model="small",
+                transcription_engine="faster_whisper",
 
-    return {
-        "text": text,
-        "confidence": 1.0,  # RealtimeSTT doesn't expose logprob directly
-        "language": "en",
-        "latency_ms": latency_ms
-    }
+                # Real-time preview — tiny model is fast enough for live text
+                enable_realtime_transcription=True,
+                realtime_model_type="tiny",
+                realtime_processing_pause=0.1,
+
+                # No mic — we feed audio manually
+                use_microphone=False,
+
+                # Language
+                language="en",
+
+                # VAD — detects when you stop speaking
+                silero_sensitivity=0.4,
+                webrtc_sensitivity=2,
+                post_speech_silence_duration=0.6,
+                min_length_of_recording=0.4,
+                min_gap_between_recordings=0.1,
+
+                # Accuracy settings
+                beam_size=5,
+                beam_size_realtime=1,
+                temperature=0.0,
+                no_speech_threshold=0.5,
+                condition_on_previous_text=False,
+
+                # Callbacks
+                on_realtime_transcription_update=self._on_partial,
+
+                # No logging clutter
+                no_log_file=True,
+                spinner=False,
+            )
+
+            self._ready = True
+            print("[STT] Pipeline ready. Waiting for audio...")
+
+            # Keep running — process utterances continuously
+            while self._ready:
+                text = self.recorder.text()
+                text = (text or "").strip()
+                if text:
+                    print(f"[STT] Final: '{text}'")
+                    self.on_final(text)
+
+        except Exception as e:
+            print(f"[STT] Pipeline error: {e}")
+            self._ready = False
+
+    def _on_partial(self, text: str):
+        """Called by RealtimeSTT with live text while speaking."""
+        if text and text.strip():
+            self.on_partial(text.strip())
+
+    def feed(self, audio_bytes: bytes):
+        """Feed audio chunk from browser into RealtimeSTT."""
+        if self.recorder and self._ready:
+            try:
+                # RealtimeSTT expects 16kHz mono PCM
+                # Browser sends WebM — we convert first
+                pcm = self._convert_to_pcm(audio_bytes)
+                if pcm:
+                    self.recorder.feed_audio(pcm, original_sample_rate=16000)
+            except Exception as e:
+                print(f"[STT] Feed error: {e}")
+
+    def _convert_to_pcm(self, audio_bytes: bytes) -> Optional[bytes]:
+        """Convert WebM audio bytes to 16kHz mono PCM."""
+        import subprocess
+        import tempfile
+        import os
+
+        webm_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix='.webm', delete=False) as f:
+                f.write(audio_bytes)
+                webm_path = f.name
+
+            result = subprocess.run([
+                'ffmpeg', '-y',
+                '-i', webm_path,
+                '-ar', '16000',
+                '-ac', '1',
+                '-f', 's16le',  # raw PCM format RealtimeSTT expects
+                'pipe:1'        # output to stdout
+            ], capture_output=True, timeout=3)
+
+            if result.returncode == 0 and result.stdout:
+                return result.stdout
+            return None
+
+        except Exception as e:
+            print(f"[STT] Conversion error: {e}")
+            return None
+        finally:
+            if webm_path:
+                try:
+                    os.remove(webm_path)
+                except:
+                    pass
+
+    def is_ready(self) -> bool:
+        return self._ready
+
+    def stop(self):
+        """Stop the pipeline."""
+        self._ready = False
+        if self.recorder:
+            try:
+                self.recorder.stop()
+                self.recorder.shutdown()
+            except:
+                pass
+        print("[STT] Pipeline stopped.")
 
 
-# ─── SIMPLE FUNCTION FOR FASTAPI ENDPOINT ────────────────────────────────────
-# This is what main.py calls
+# ─── FALLBACK for /stt POST endpoint ─────────────────────────────────────────
+
+_fallback_model = None
 
 def transcribe_audio(audio_bytes: bytes) -> dict:
-    """
-    NOTE: RealtimeSTT reads directly from the microphone.
-    This function is kept for API compatibility but RealtimeSTT
-    is better used via the WebSocket streaming endpoint.
-    For the /stt POST endpoint, we still use faster-whisper directly
-    as a fallback for browser audio bytes.
-    """
-    import io
+    """Fallback using faster-whisper directly for POST /stt endpoint."""
+    global _fallback_model
+
+    if _fallback_model is None:
+        from faster_whisper import WhisperModel
+        print("[STT] Loading fallback small model...")
+        _fallback_model = WhisperModel("small", device="cpu", compute_type="int8")
+        print("[STT] Fallback ready.")
+
     import subprocess
     import tempfile
     import os
-    import time
     import numpy as np
-    from faster_whisper import WhisperModel
-
-    # Lazy load fallback model
-    if not hasattr(transcribe_audio, '_model'):
-        print("[STT] Loading fallback Whisper small model...")
-        transcribe_audio._model = WhisperModel("small", device="cpu", compute_type="int8")
-        print("[STT] Fallback model ready.")
+    import wave
 
     start = time.time()
     webm_path = None
@@ -133,7 +195,6 @@ def transcribe_audio(audio_bytes: bytes) -> dict:
         if result.returncode != 0:
             return {"text": "", "confidence": 0.0, "language": "en", "error": "conversion_failed"}
 
-        import wave
         with wave.open(wav_path, 'r') as wf:
             frames = wf.readframes(wf.getnframes())
             audio_np = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
@@ -142,14 +203,10 @@ def transcribe_audio(audio_bytes: bytes) -> dict:
         if rms < 0.005:
             return {"text": "", "confidence": 0.0, "language": "en", "error": "too_quiet"}
 
-        segments, info = transcribe_audio._model.transcribe(
+        segments, info = _fallback_model.transcribe(
             wav_path,
             beam_size=5,
             language="en",
-            initial_prompt=(
-                "RNSIT, RNS Institute of Technology, USN, SGPA, CIE, "
-                "fees, hostel, canteen, library, admin block, principal"
-            ),
             vad_filter=True,
             temperature=0.0,
             condition_on_previous_text=False,
@@ -157,23 +214,19 @@ def transcribe_audio(audio_bytes: bytes) -> dict:
         )
 
         full_text = ""
-        confidence_scores = []
+        scores = []
         for segment in segments:
             full_text += segment.text + " "
-            confidence_scores.append(segment.avg_logprob)
+            scores.append(segment.avg_logprob)
 
         full_text = full_text.strip()
-        avg_confidence = 0.0
-        if confidence_scores:
-            avg_logprob = sum(confidence_scores) / len(confidence_scores)
-            avg_confidence = max(0.0, min(1.0, avg_logprob + 1.0))
-
+        confidence = max(0.0, min(1.0, sum(scores)/len(scores) + 1.0)) if scores else 0.0
         latency_ms = int((time.time() - start) * 1000)
-        print(f"[STT] '{full_text}' | conf: {avg_confidence:.2f} | {latency_ms}ms")
 
+        print(f"[STT] '{full_text}' | conf:{confidence:.2f} | {latency_ms}ms")
         return {
             "text": full_text,
-            "confidence": round(avg_confidence, 2),
+            "confidence": round(confidence, 2),
             "language": info.language,
             "latency_ms": latency_ms
         }
