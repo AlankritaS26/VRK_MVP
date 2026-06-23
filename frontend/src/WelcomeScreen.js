@@ -1,7 +1,6 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 
 const BACKEND = process.env.REACT_APP_BACKEND_URL || 'http://127.0.0.1:8000';
-const WS_BACKEND = BACKEND.replace('http', 'ws');
 
 export default function WelcomeScreen({ session, messages, setMessages, askingName }) {
   const scrollRef      = useRef(null);
@@ -9,11 +8,10 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const isMounted      = useRef(true);
   const isSpeaking     = useRef(false);
   const isListening    = useRef(false);
-  const wsRef          = useRef(null);
-  const mediaRecRef    = useRef(null);
   const analyserRef    = useRef(null);
   const animFrameRef   = useRef(null);
   const canvasRef      = useRef(null);
+  const audioCtxRef    = useRef(null);
 
   const [name,       setName]       = useState('');
   const [saveData,   setSaveData]   = useState(true);
@@ -23,7 +21,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const [deleted,    setDeleted]    = useState(false);
   const [liveText,   setLiveText]   = useState('');
   const [listening,  setListening]  = useState(false);
-  const [status,     setStatus]     = useState('ready'); // ready | connecting | listening | processing | speaking
+  const [status,     setStatus]     = useState('ready');
 
   const visitorName = session?.user_name    || 'Guest';
   const isReturning = session?.is_returning || false;
@@ -42,10 +40,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
   useEffect(() => {
     isMounted.current = true;
-    return () => {
-      isMounted.current = false;
-      stopListening();
-    };
+    return () => { isMounted.current = false; stopWaveform(); };
   }, []);
 
   useEffect(() => {
@@ -62,53 +57,17 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     }]);
   }, [setMessages]);
 
-  // ── WAVEFORM ANIMATION ──────────────────────────────────────────────────
-  const drawWaveform = useCallback(() => {
-    const canvas = canvasRef.current;
-    const analyser = analyserRef.current;
-    if (!canvas || !analyser) return;
-
-    const ctx = canvas.getContext('2d');
-    const bufferLength = analyser.frequencyBinCount;
-    const dataArray = new Uint8Array(bufferLength);
-
-    const draw = () => {
-      animFrameRef.current = requestAnimationFrame(draw);
-      analyser.getByteFrequencyData(dataArray);
-
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-      const barWidth = 3;
-      const gap = 2;
-      const bars = Math.floor(canvas.width / (barWidth + gap));
-      const step = Math.floor(bufferLength / bars);
-
-      for (let i = 0; i < bars; i++) {
-        const value = dataArray[i * step] / 255;
-        const barHeight = Math.max(4, value * canvas.height * 0.9);
-        const x = i * (barWidth + gap);
-        const y = (canvas.height - barHeight) / 2;
-
-        // Jarvis blue gradient
-        const gradient = ctx.createLinearGradient(0, y, 0, y + barHeight);
-        gradient.addColorStop(0, `rgba(100, 200, 255, ${0.4 + value * 0.6})`);
-        gradient.addColorStop(1, `rgba(26, 35, 126, ${0.4 + value * 0.6})`);
-
-        ctx.fillStyle = gradient;
-        ctx.beginPath();
-        ctx.roundRect(x, y, barWidth, barHeight, 2);
-        ctx.fill();
-      }
-    };
-
-    draw();
-  }, []);
-
+  // ── WAVEFORM ─────────────────────────────────────────────────────────────
   const stopWaveform = useCallback(() => {
     if (animFrameRef.current) {
       cancelAnimationFrame(animFrameRef.current);
       animFrameRef.current = null;
     }
+    if (audioCtxRef.current) {
+      try { audioCtxRef.current.close(); } catch(e) {}
+      audioCtxRef.current = null;
+    }
+    analyserRef.current = null;
     const canvas = canvasRef.current;
     if (canvas) {
       const ctx = canvas.getContext('2d');
@@ -116,24 +75,49 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     }
   }, []);
 
-  // ── STT via WebSocket ───────────────────────────────────────────────────
-  const stopListening = useCallback(() => {
-    if (mediaRecRef.current && mediaRecRef.current.state !== 'inactive') {
-      mediaRecRef.current.stop();
-    }
-    if (wsRef.current) {
-      try { wsRef.current.send('stop'); } catch(e) {}
-      wsRef.current.close();
-      wsRef.current = null;
-    }
-    isListening.current = false;
-    if (isMounted.current) {
-      setListening(false);
-      setStatus('ready');
-    }
-    stopWaveform();
-  }, [stopWaveform]);
+  const startWaveform = useCallback((stream) => {
+    const audioCtx = new AudioContext();
+    audioCtxRef.current = audioCtx;
+    const source = audioCtx.createMediaStreamSource(stream);
+    const analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 256;
+    source.connect(analyser);
+    analyserRef.current = analyser;
 
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+    const draw = () => {
+      animFrameRef.current = requestAnimationFrame(draw);
+      analyser.getByteFrequencyData(dataArray);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      const barWidth = 3;
+      const gap = 2;
+      const bars = Math.floor(canvas.width / (barWidth + gap));
+      const step = Math.floor(dataArray.length / bars);
+
+      for (let i = 0; i < bars; i++) {
+        const value = dataArray[i * step] / 255;
+        const barHeight = Math.max(4, value * canvas.height * 0.9);
+        const x = i * (barWidth + gap);
+        const y = (canvas.height - barHeight) / 2;
+        const gradient = ctx.createLinearGradient(0, y, 0, y + barHeight);
+        gradient.addColorStop(0, `rgba(100, 200, 255, ${0.4 + value * 0.6})`);
+        gradient.addColorStop(1, `rgba(26, 35, 126, ${0.4 + value * 0.6})`);
+        ctx.fillStyle = gradient;
+        ctx.beginPath();
+        ctx.roundRect(x, y, barWidth, barHeight, 2);
+        ctx.fill();
+      }
+    };
+    draw();
+  }, []);
+
+  // ── STT via POST /stt ─────────────────────────────────────────────────────
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   const startListening = useCallback(() => {
     if (!isMounted.current) return;
     if (isListening.current) return;
@@ -143,69 +127,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     isListening.current = true;
     setListening(true);
     setLiveText('');
-    setStatus('connecting');
+    setStatus('listening');
 
-    // Connect WebSocket
-    const ws = new WebSocket(`${WS_BACKEND}/ws/stt`);
-    wsRef.current = ws;
-
-    ws.onopen = () => {
-      console.log('[WS] Connected to STT');
-    };
-
-    ws.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-
-      if (data.type === 'ready') {
-        // Pipeline ready — start mic
-        setStatus('listening');
-        startMic(ws);
-      }
-
-      else if (data.type === 'partial') {
-        // Live text while speaking
-        if (isMounted.current) setLiveText(data.text);
-      }
-
-      else if (data.type === 'final') {
-        // Final transcript — send to backend
-        const heard = data.text.trim();
-        if (heard && heard.length > 1 && !isSpeaking.current) {
-          console.log('[STT] Final:', heard);
-          if (isMounted.current) {
-            setLiveText(heard);
-            setStatus('processing');
-          }
-          sendToBackend(heard);
-        }
-      }
-
-      else if (data.type === 'error') {
-        console.error('[STT] Error:', data.message);
-        stopListening();
-        setTimeout(startListening, 1000);
-      }
-    };
-
-    ws.onclose = () => {
-      console.log('[WS] Disconnected');
-      if (isListening.current) {
-        isListening.current = false;
-        if (isMounted.current) {
-          setListening(false);
-          setStatus('ready');
-        }
-      }
-    };
-
-    ws.onerror = (e) => {
-      console.error('[WS] Error:', e);
-      stopListening();
-    };
-
-  }, [askingName, stopListening]);
-
-  const startMic = useCallback((ws) => {
     navigator.mediaDevices.getUserMedia({
       audio: {
         noiseSuppression: true,
@@ -214,46 +137,105 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         sampleRate: 16000
       }
     }).then(stream => {
-      // Waveform setup
-      const audioCtx = new AudioContext();
-      const source = audioCtx.createMediaStreamSource(stream);
-      const analyser = audioCtx.createAnalyser();
-      analyser.fftSize = 256;
-      source.connect(analyser);
-      analyserRef.current = analyser;
-      drawWaveform();
+      startWaveform(stream);
 
-      // MediaRecorder — send chunks every 250ms
-      const recorder = new MediaRecorder(stream, {
-        mimeType: 'audio/webm;codecs=opus'
-      });
-      mediaRecRef.current = recorder;
+      const audioChunks = [];
+      const mediaRecorder = new MediaRecorder(stream);
 
-      recorder.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0 && ws.readyState === WebSocket.OPEN) {
-          e.data.arrayBuffer().then(buf => {
-            ws.send(buf);
+      // Silence detection
+      const silenceCtx = new AudioContext();
+      const silenceSource = silenceCtx.createMediaStreamSource(stream);
+      const silenceAnalyser = silenceCtx.createAnalyser();
+      silenceAnalyser.fftSize = 512;
+      silenceSource.connect(silenceAnalyser);
+      const silenceData = new Uint8Array(silenceAnalyser.frequencyBinCount);
+
+      let silenceStart = null;
+      let hasSpeech = false;
+      let stopped = false;
+      const SILENCE_THRESHOLD = 20;
+      const SILENCE_DURATION = 1200;
+      const MAX_DURATION = 8000;
+      const speechStart = Date.now();
+
+      const stopRecording = () => {
+        if (stopped) return;
+        stopped = true;
+        clearInterval(silenceChecker);
+        try { silenceCtx.close(); } catch(e) {}
+        if (mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+      };
+
+      const silenceChecker = setInterval(() => {
+        silenceAnalyser.getByteFrequencyData(silenceData);
+        const avg = silenceData.reduce((a, b) => a + b, 0) / silenceData.length;
+
+        if (avg > SILENCE_THRESHOLD) {
+          hasSpeech = true;
+          silenceStart = null;
+        } else if (hasSpeech) {
+          if (!silenceStart) silenceStart = Date.now();
+          if (Date.now() - silenceStart > SILENCE_DURATION) stopRecording();
+        }
+
+        if (Date.now() - speechStart > MAX_DURATION) stopRecording();
+      }, 100);
+
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) audioChunks.push(e.data);
+      };
+
+      mediaRecorder.onstop = async () => {
+        stream.getTracks().forEach(t => t.stop());
+        stopWaveform();
+        isListening.current = false;
+        if (isMounted.current) setListening(false);
+
+        if (!hasSpeech || audioChunks.length === 0) {
+          setStatus('ready');
+          if (!isSpeaking.current && isMounted.current) setTimeout(startListening, 400);
+          return;
+        }
+
+        setStatus('processing');
+        const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+        const arrayBuffer = await audioBlob.arrayBuffer();
+
+        try {
+          const response = await fetch(BACKEND + '/stt', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/octet-stream' },
+            body: new Uint8Array(arrayBuffer)
           });
+
+          const result = await response.json();
+          console.log('[STT WHISPER]', result);
+          const heard = (result.text || '').trim();
+
+          if (heard && heard.length > 1 && !isSpeaking.current) {
+            if (isMounted.current) setLiveText(heard);
+            sendToBackend(heard);
+          } else {
+            setStatus('ready');
+            if (!isSpeaking.current && isMounted.current) setTimeout(startListening, 400);
+          }
+        } catch (err) {
+          console.error('[STT] Error:', err);
+          setStatus('ready');
+          if (!isSpeaking.current && isMounted.current) setTimeout(startListening, 400);
         }
       };
 
-      recorder.onstop = () => {
-        stream.getTracks().forEach(t => t.stop());
-        audioCtx.close();
-        analyserRef.current = null;
-        stopWaveform();
-      };
-
-      // Send chunks every 250ms for smooth real-time experience
-      recorder.start(250);
+      mediaRecorder.start(100);
 
     }).catch(err => {
       console.error('[MIC] Error:', err);
-      stopListening();
+      isListening.current = false;
+      setListening(false);
+      setStatus('ready');
     });
-  }, [drawWaveform, stopWaveform, stopListening]);
+  }, [askingName, startWaveform, stopWaveform]);
 
-  // ── SEND TO BACKEND ─────────────────────────────────────────────────────
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const sendToBackend = useCallback(async (text) => {
     if (!text) return;
@@ -265,9 +247,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     if (goodbyeWords.some(w => text.toLowerCase().includes(w))) {
       addMessage('You are most welcome! Have a wonderful day. Goodbye!', 'kiosk');
       speak('You are most welcome! Have a wonderful day. Goodbye!');
-      try {
-        await fetch(BACKEND + '/session/end?session_id=' + sid, { method: 'POST' });
-      } catch(e) {}
+      try { await fetch(BACKEND + '/session/end?session_id=' + sid, { method: 'POST' }); } catch(e) {}
       return;
     }
 
@@ -292,12 +272,11 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     } catch(e) {
       console.error('[sendToBackend]', e);
       isSpeaking.current = false;
-      setStatus('listening');
+      setStatus('ready');
       if (isMounted.current) startListening();
     }
   }, [session, addMessage]);
 
-  // ── SPEAK ───────────────────────────────────────────────────────────────
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const speak = useCallback((text) => {
     window.speechSynthesis.cancel();
@@ -309,10 +288,12 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     utter.volume = 1;
     utter.onend = () => {
       isSpeaking.current = false;
+      setStatus('ready');
       if (isMounted.current) startListening();
     };
     utter.onerror = () => {
       isSpeaking.current = false;
+      setStatus('ready');
       if (isMounted.current) startListening();
     };
     window.speechSynthesis.speak(utter);
@@ -343,21 +324,18 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     } catch(e) { console.error(e); }
   };
 
-  // Status label
   const statusLabel = {
-    ready:       'Microphone ready',
-    connecting:  'Connecting...',
-    listening:   'Listening — speak your question',
-    processing:  'Processing...',
-    speaking:    'Speaking...'
+    ready:      'Microphone ready',
+    listening:  'Listening — speak your question',
+    processing: 'Processing...',
+    speaking:   'Speaking...'
   }[status] || 'Ready';
 
   const statusColor = {
-    ready:       '#ffb300',
-    connecting:  '#42a5f5',
-    listening:   '#43a047',
-    processing:  '#7e57c2',
-    speaking:    '#ef5350'
+    ready:      '#ffb300',
+    listening:  '#43a047',
+    processing: '#7e57c2',
+    speaking:   '#ef5350'
   }[status] || '#ffb300';
 
   const inputStyle = {
@@ -378,7 +356,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   return (
     <div style={{ minHeight: '100vh', background: '#f5f6fa', fontFamily: "'Segoe UI', Arial, sans-serif", display: 'flex', flexDirection: 'column' }}>
 
-      {/* Header */}
       <header style={{ background: '#ffffff', borderBottom: '2px solid #e8eaf6', padding: '14px 32px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', boxShadow: '0 2px 10px rgba(26,35,126,0.07)' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
           <img src="/rnslogo.webp" alt="RNSIT" style={{ height: '56px', objectFit: 'contain' }} />
@@ -401,7 +378,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         </div>
       </header>
 
-      {/* Greeting strip */}
       {!askingName && (
         <div style={{ background: 'linear-gradient(90deg, #1a237e, #283593)', color: '#fff', padding: '11px 32px', fontSize: '14px', fontWeight: '500', display: 'flex', alignItems: 'center', gap: '10px' }}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#90caf9" strokeWidth="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/></svg>
@@ -409,7 +385,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         </div>
       )}
 
-      {/* Delete Modal */}
       {deleteMode && (
         <div onClick={e => e.target === e.currentTarget && setDeleteMode(false)}
           style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.35)', zIndex: 200, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
@@ -447,7 +422,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         </div>
       )}
 
-      {/* Name Modal */}
       {askingName && !deleteMode && (
         <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.35)', zIndex: 200, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
           <div style={{ background: '#fff', borderRadius: '16px', padding: '40px', width: '440px', boxShadow: '0 12px 48px rgba(0,0,0,0.18)' }}>
@@ -501,15 +475,12 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         </div>
       )}
 
-      {/* Chat Area */}
       <div ref={scrollRef} style={{ flex: '1 1 0', overflowY: 'auto', minHeight: 0, padding: '28px 32px', display: 'flex', flexDirection: 'column', gap: '16px', maxWidth: '900px', width: '100%', margin: '0 auto', alignSelf: 'stretch' }}>
         {messages.length === 0 && !liveText ? (
           <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '16px', paddingTop: '40px' }}>
-
-            {/* Jarvis-style waveform */}
-            <div style={{ position: 'relative', width: '200px', height: '80px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <div style={{ width: '220px', height: '80px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
               {listening ? (
-                <canvas ref={canvasRef} width={200} height={80}
+                <canvas ref={canvasRef} width={220} height={80}
                   style={{ borderRadius: '12px', background: 'rgba(26,35,126,0.04)' }} />
               ) : (
                 <div style={{ width: '72px', height: '72px', borderRadius: '50%', background: '#e8eaf6', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
@@ -522,9 +493,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
                 </div>
               )}
             </div>
-
             <div style={{ fontSize: '17px', fontWeight: '700', color: '#1a237e' }}>
-              {status === 'connecting'  && 'Connecting...'}
               {status === 'listening'   && 'Listening...'}
               {status === 'processing'  && 'Processing...'}
               {status === 'speaking'    && 'Speaking...'}
@@ -536,14 +505,12 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           </div>
         ) : (
           <>
-            {/* Waveform above chat when listening */}
             {listening && (
-              <div style={{ display: 'flex', justifyContent: 'center', marginBottom: '8px' }}>
-                <canvas ref={canvasRef} width={300} height={50}
+              <div style={{ display: 'flex', justifyContent: 'center', marginBottom: '4px' }}>
+                <canvas ref={canvasRef} width={300} height={48}
                   style={{ borderRadius: '8px', background: 'rgba(26,35,126,0.04)' }} />
               </div>
             )}
-
             {messages.map((msg, i) => (
               <div key={i} style={{ display: 'flex', flexDirection: 'column', alignItems: msg.speaker === 'kiosk' ? 'flex-start' : 'flex-end' }}>
                 <div style={{ fontSize: '11px', color: '#bbb', marginBottom: '4px', paddingLeft: msg.speaker === 'kiosk' ? '4px' : 0, paddingRight: msg.speaker !== 'kiosk' ? '4px' : 0, fontWeight: '500' }}>
@@ -562,7 +529,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
                 </div>
               </div>
             ))}
-
             {liveText && (
               <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
                 <div style={{ fontSize: '11px', color: '#bbb', marginBottom: '4px', paddingRight: '4px' }}>{visitorName} (speaking...)</div>
@@ -575,7 +541,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         )}
       </div>
 
-      {/* Footer */}
       <footer style={{ background: '#ffffff', borderTop: '1.5px solid #e8eaf6', padding: '12px 32px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', boxShadow: '0 -2px 8px rgba(26,35,126,0.05)' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
           <div style={{ width: '10px', height: '10px', borderRadius: '50%', background: statusColor, transition: 'background 0.3s', animation: listening ? 'pulse 1.5s infinite' : 'none' }} />
