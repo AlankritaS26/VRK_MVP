@@ -12,9 +12,12 @@ import numpy as np
 import wave
 from faster_whisper import WhisperModel
 
-print("[STT] Loading Whisper small model...")
-model = WhisperModel("small", device="cpu", compute_type="int8")
-print("[STT] Whisper small model ready.")
+print("[STT] Loading Whisper turbo model...")
+# "turbo" is the correct shorthand for large-v3-turbo in faster-whisper.
+# If your package version is older and doesn't recognize "turbo", use:
+# model = WhisperModel("deepdml/faster-whisper-large-v3-turbo-ct2", device="cpu", compute_type="int8")
+model = WhisperModel("turbo", device="cpu", compute_type="int8")
+print("[STT] Whisper turbo model ready.")
 
 # Keep STTPipeline class so main.py import doesn't break
 class STTPipeline:
