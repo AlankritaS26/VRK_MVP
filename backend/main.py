@@ -36,7 +36,7 @@ from backend.database import (
     get_admission_fee_by_branch, get_admission_requirements,
 )
 from backend.llm import initialize_rag_knowledge_base, generate_rag_kiosk_response, close_llm_client
-from backend.stt import STTPipeline, transcribe_audio
+from backend.stt import transcribe_audio
 from backend.tts import text_to_speech
 
 load_dotenv()
