@@ -1,330 +1,136 @@
-import psycopg2
 import os
+import logging
+from datetime import datetime
+from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
 
 load_dotenv()
+logger = logging.getLogger("RNSIT_Kiosk.Database")
 
-def get_db_connection():
+# Secure connection setup
+MONGO_URI = os.getenv("MONGO_URI")
+client = AsyncIOMotorClient(MONGO_URI)
+
+# Your global database and collections
+db = client["rnsit_db"]
+college_collection = db["college_profile"]  # Stores RNSIT details / FAQs
+faces_collection = db["faces"]              # Stores face embeddings/IDs
+sessions_collection = db["sessions"]        # Track active/inactive kiosk sessions
+interactions_collection = db["interactions"]# Chat history logs
+
+# ==========================================
+# CORE DB LIFECYCLE HANDLERS
+# ==========================================
+
+async def get_kiosk_data():
+    """Fetches the single main RNSIT document containing all info and FAQs."""
     try:
-        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
-        return conn
+        data = await college_collection.find_one({})
+        if data:
+            data["_id"] = str(data["_id"])
+        return data
     except Exception as e:
-        print(f"Database Connection Error: {e}")
+        logger.error(f"MongoDB Error fetching kiosk data: {e}")
         return None
 
-def init_db():
-    conn = get_db_connection()
-    if conn:
-        cur = conn.cursor()
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS interactions (
-                id SERIAL PRIMARY KEY,
-                session_id VARCHAR(50),
-                input_text TEXT,
-                response_text TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        ''')
-        # faces table WITH encoding column
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS faces (
-                id SERIAL PRIMARY KEY,
-                face_id VARCHAR(50) UNIQUE NOT NULL,
-                name VARCHAR(100) NOT NULL,
-                label_int INTEGER UNIQUE NOT NULL,
-                encoding FLOAT8[],
-                registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                visit_count INTEGER DEFAULT 1
-            );
-        ''')
-        # Add encoding column if table already exists without it
-        cur.execute('''
-            ALTER TABLE faces ADD COLUMN IF NOT EXISTS encoding FLOAT8[];
-        ''')
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS sessions (
-                id SERIAL PRIMARY KEY,
-                session_id VARCHAR(50) UNIQUE NOT NULL,
-                face_id VARCHAR(50) REFERENCES faces(face_id) ON DELETE SET NULL,
-                user_name VARCHAR(100),
-                is_returning BOOLEAN DEFAULT FALSE,
-                visit_count INTEGER DEFAULT 1,
-                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                ended_at TIMESTAMP
-            );
-        ''')
-        conn.commit()
-        cur.close()
-        conn.close()
-        print("PostgreSQL: all tables ready.")
+# ==========================================
+# SESSION MANAGEMENT (Replaces PostgreSQL tables)
+# ==========================================
 
-def get_all_faces():
-    conn = get_db_connection()
-    if not conn: return {}
+async def save_session(session_id: str, face_id: str | None, user_name: str, is_returning: bool, visit_count: int):
+    """
+    Saves or logs a kiosk session. 
+    MongoDB handles creating the session record dynamically without a strict schema definition.
+    """
     try:
-        cur = conn.cursor()
-        cur.execute("SELECT label_int, face_id, name, registered_at, last_seen, visit_count FROM faces")
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-        result = {}
-        for row in rows:
-            result[row[0]] = {
-                "face_id":     row[1],
-                "name":        row[2],
-                "registered":  str(row[3]),
-                "last_seen":   str(row[4]),
-                "visit_count": row[5]
+        await sessions_collection.update_one(
+            {"session_id": session_id},
+            {
+                "$set": {
+                    "face_id": face_id,
+                    "user_name": user_name,
+                    "is_returning": is_returning,
+                    "visit_count": visit_count,
+                    "is_active": True,
+                    "last_activity": datetime.now().isoformat()
+                },
+                "$setOnInsert": {
+                    "started_at": datetime.now().isoformat()
+                }
+            },
+            upsert=True
+        )
+        logger.info(f"[MongoDB] Session indexed: {session_id}")
+    except Exception as e:
+        logger.error(f"Error tracking session: {e}")
+
+async def save_interaction(session_id: str, question: str, answer: str):
+    """Logs individual conversational components directly into cloud transactions."""
+    try:
+        await interactions_collection.insert_one({
+            "session_id": session_id,
+            "input_text": question,
+            "response_text": answer,
+            "timestamp": datetime.now().isoformat()
+        })
+    except Exception as e:
+        logger.error(f"Error logging conversational interaction: {e}")
+
+# ==========================================
+# BIOMETRICS & FACE RETRIEVAL HANDLERS
+# ==========================================
+
+async def save_face_encoding(face_id: str, name: str, encoding: list):
+    """Saves or updates a biometric profile mapping vector representations directly."""
+    try:
+        await faces_collection.update_one(
+            {"face_id": face_id},
+            {
+                "$set": {
+                    "name": name,
+                    "encoding": encoding,
+                    "last_seen": datetime.now().isoformat()
+                },
+                "$setOnInsert": {
+                    "registered_at": datetime.now().isoformat(),
+                    "visit_count": 1
+                }
+            },
+            upsert=True
+        )
+        logger.info(f"[MongoDB] Face Registered: {name}")
+    except Exception as e:
+        logger.error(f"Error updating biometric vector signature: {e}")
+
+async def get_all_face_encodings():
+    """Retrieves all registered biometric keys for local processing frames."""
+    try:
+        cursor = faces_collection.find({"encoding": {"$ne": None}})
+        results = []
+        async for doc in cursor:
+            results.append({
+                "face_id": doc["face_id"],
+                "name": doc["name"],
+                "encoding": doc["encoding"]
+            })
+        return results
+    except Exception as e:
+        logger.error(f"Error querying biometric records: {e}")
+        return []
+
+async def update_face_seen(face_id: str):
+    """
+    Increments visit metrics asynchronously when recognized by the camera loop.
+    Fixes the ImportError in main.py.
+    """
+    try:
+        await faces_collection.update_one(
+            {"face_id": face_id},
+            {
+                "$inc": {"visit_count": 1},
+                "$set": {"last_seen": datetime.now().isoformat()}
             }
-        return result
-    except Exception as e:
-        print(f"get_all_faces error: {e}")
-        return {}
-
-def save_face(label_int, face_id, name):
-    conn = get_db_connection()
-    if not conn: return
-    try:
-        cur = conn.cursor()
-        cur.execute('''
-            INSERT INTO faces (label_int, face_id, name)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (face_id) DO UPDATE
-            SET name = EXCLUDED.name, last_seen = CURRENT_TIMESTAMP
-        ''', (label_int, face_id, name))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"save_face error: {e}")
-
-def update_face_seen(face_id):
-    conn = get_db_connection()
-    if not conn: return
-    try:
-        cur = conn.cursor()
-        cur.execute('''
-            UPDATE faces
-            SET last_seen = CURRENT_TIMESTAMP, visit_count = visit_count + 1
-            WHERE face_id = %s
-        ''', (face_id,))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"update_face_seen error: {e}")
-
-def get_face_by_id(face_id):
-    conn = get_db_connection()
-    if not conn: return None
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT face_id, name, label_int, visit_count FROM faces WHERE face_id = %s", (face_id,))
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
-        if row:
-            return {"face_id": row[0], "name": row[1], "label_int": row[2], "visit_count": row[3]}
-        return None
-    except Exception as e:
-        print(f"get_face_by_id error: {e}")
-        return None
-
-def delete_face_by_name(name):
-    conn = get_db_connection()
-    if not conn: return False
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT face_id FROM faces WHERE LOWER(name) = LOWER(%s)", (name,))
-        rows = cur.fetchall()
-        if not rows:
-            cur.close()
-            conn.close()
-            return False
-        cur.execute("DELETE FROM faces WHERE LOWER(name) = LOWER(%s)", (name,))
-        conn.commit()
-        cur.close()
-        conn.close()
-        return [r[0] for r in rows]
-    except Exception as e:
-        print(f"delete_face error: {e}")
-        return False
-
-def get_next_label_int():
-    conn = get_db_connection()
-    if not conn: return 0
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT COALESCE(MAX(label_int), -1) + 1 FROM faces")
-        result = cur.fetchone()[0]
-        cur.close()
-        conn.close()
-        return result
-    except Exception as e:
-        print(f"get_next_label_int error: {e}")
-        return 0
-
-def save_session(session_id, face_id, user_name, is_returning, visit_count):
-    conn = get_db_connection()
-    if not conn: return
-    try:
-        cur = conn.cursor()
-        fid = face_id if face_id and face_id.strip() else None
-        cur.execute('''
-            INSERT INTO sessions (session_id, face_id, user_name, is_returning, visit_count)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (session_id) DO UPDATE
-            SET visit_count = EXCLUDED.visit_count,
-                is_returning = EXCLUDED.is_returning,
-                user_name = EXCLUDED.user_name,
-                ended_at = NULL
-        ''', (session_id, fid, user_name, is_returning, visit_count))
-        conn.commit()
-        cur.close()
-        conn.close()
-        print(f"[DB] Session saved/updated: {session_id} user={user_name}")
-    except Exception as e:
-        print(f"save_session error: {e}")
-
-def end_session(session_id):
-    conn = get_db_connection()
-    if not conn: return
-    try:
-        cur = conn.cursor()
-        cur.execute("UPDATE sessions SET ended_at = CURRENT_TIMESTAMP WHERE session_id = %s", (session_id,))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"end_session error: {e}")
-
-def save_interaction(session_id, question, answer):
-    conn = get_db_connection()
-    if not conn: return
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO interactions (session_id, input_text, response_text) VALUES (%s, %s, %s)",
-            (session_id, question, answer)
         )
-        conn.commit()
-        cur.close()
-        conn.close()
+        logger.info(f"[MongoDB] Biometric presence incremented for profile ID: {face_id}")
     except Exception as e:
-        print(f"save_interaction error: {e}")
-
-def save_face_image(face_id, image_index, image_bytes):
-    conn = get_db_connection()
-    if not conn: return
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO face_images (face_id, image_index, image_data) VALUES (%s, %s, %s)",
-            (face_id, image_index, psycopg2.Binary(image_bytes))
-        )
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"save_face_image error: {e}")
-
-def load_face_images(face_id):
-    conn = get_db_connection()
-    if not conn: return []
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT image_data FROM face_images WHERE face_id = %s ORDER BY image_index",
-            (face_id,)
-        )
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-        return [bytes(row[0]) for row in rows]
-    except Exception as e:
-        print(f"load_face_images error: {e}")
-        return []
-
-def delete_face_images(face_id):
-    conn = get_db_connection()
-    if not conn: return
-    try:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM face_images WHERE face_id = %s", (face_id,))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"delete_face_images error: {e}")
-
-def get_admission_fee_by_branch(search_term: str):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    try:
-        query = """
-            SELECT branch_full_name, annual_fee, instalment_1, instalment_2
-            FROM public.management_program_fees
-            WHERE LOWER(branch_full_name) LIKE %s OR LOWER(branch_code) LIKE %s;
-        """
-        cursor.execute(query, (f"%{search_term}%", f"%{search_term}%"))
-        return cursor.fetchone()
-    except Exception as e:
-        print(f"Error querying management fees: {e}")
-        return None
-    finally:
-        cursor.close()
-        conn.close()
-
-def get_admission_requirements(quota_type: str):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    try:
-        query = """
-            SELECT document_name, copies_required
-            FROM public.admission_requirements
-            WHERE LOWER(quota_type) = LOWER(%s);
-        """
-        cursor.execute(query, (quota_type,))
-        return cursor.fetchall()
-    except Exception as e:
-        print(f"Error querying requirements: {e}")
-        return []
-    finally:
-        cursor.close()
-        conn.close()
-
-def save_face_encoding(face_id, name, encoding):
-    conn = get_db_connection()
-    if not conn: return
-    try:
-        label_int = get_next_label_int()
-        cur = conn.cursor()
-        cur.execute('''
-            INSERT INTO faces (label_int, face_id, name, encoding)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT (face_id) DO UPDATE
-            SET name = EXCLUDED.name,
-                encoding = EXCLUDED.encoding,
-                last_seen = CURRENT_TIMESTAMP
-        ''', (label_int, face_id, name, encoding))
-        conn.commit()
-        cur.close()
-        conn.close()
-        print(f"[DB] Face encoding saved: {name} ({face_id})")
-    except Exception as e:
-        print(f"save_face_encoding error: {e}")
-
-def get_all_face_encodings():
-    conn = get_db_connection()
-    if not conn: return []
-    try:
-        cur = conn.cursor()
-        cur.execute('SELECT face_id, name, encoding FROM faces WHERE encoding IS NOT NULL')
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-        return [{'face_id': r[0], 'name': r[1], 'encoding': list(r[2])} for r in rows]
-    except Exception as e:
-        print(f"get_all_face_encodings error: {e}")
-        return []
+        logger.error(f"Error updating presence timestamp: {e}")

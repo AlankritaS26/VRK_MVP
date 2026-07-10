@@ -20,7 +20,7 @@ from typing import List
 from contextlib import asynccontextmanager
 
 import redis
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 from dotenv import load_dotenv
@@ -29,11 +29,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+# Notice everything is fully async matching your MongoDB database.py layout
+# Change lines 33-37 in backend/main.py to this exact block:
 from backend.database import (
-    init_db,
-    save_session, end_session, save_interaction,
-    delete_face_by_name, update_face_seen,
-    get_admission_fee_by_branch, get_admission_requirements,
+    get_kiosk_data,
+    save_session, save_interaction,
+    update_face_seen, save_face_encoding, get_all_face_encodings
 )
 from backend.llm import initialize_rag_knowledge_base, generate_rag_kiosk_response, close_llm_client
 from backend.stt import transcribe_audio
@@ -48,7 +49,7 @@ logging.basicConfig(
 logger = logging.getLogger("RNSIT_Kiosk")
 
 ALLOWED_ORIGINS: List[str] = os.getenv("ALLOWED_ORIGINS", "*").split(",")
-MAX_QUERY_LENGTH: int = 500
+MAX_QUERY_LENGTH: int = 300  # Lowered slightly to guard against buffer/token manipulation attacks
 SESSION_TIMEOUT_SECONDS: int = 120
 
 DOMAINS_CORRECTIONS = {
@@ -74,8 +75,6 @@ message_log: list[dict] = []
 visitor_name_response: dict = {"ready": False, "name": "", "save": True}
 _last_activity_ts: float = 0.0
 
-init_db()
-
 
 # ==========================================
 # BACKGROUND TIMEOUT LOOP
@@ -90,13 +89,36 @@ async def _session_timeout_loop():
                 if idle >= SESSION_TIMEOUT_SECONDS:
                     logger.info(f"[SESSION] Timeout after {idle:.0f}s idle — ending session")
                     sid = active_session.get("session_id")
-                    if sid:
-                        end_session(sid)
                     active_session    = None
                     _last_activity_ts = 0.0
                     await manager.broadcast({"type": "session_end", "session_id": sid, "reason": "timeout"})
     except asyncio.CancelledError:
         logger.info("[SESSION] Session timeout background task loop stopped cleanly.")
+
+
+# ==========================================
+# SECURITY LAYER (CUSTOM INCOMING GUARDRAIL)
+# ==========================================
+def verify_input_safety(query: str) -> bool:
+    """
+    A backend validation method intercepting malicious overrides or system prompt exploitation
+    before passing query contexts down to any intelligence framework modules.
+    """
+    if len(query) > MAX_QUERY_LENGTH:
+        return False
+        
+    # Block structural context injection strings
+    malicious_sequences = [
+        "ignore previous", "system prompt", "override rules", 
+        "act as a", "you are now", "delete from", "drop collection"
+    ]
+    
+    normalized_q = query.lower()
+    if any(sequence in normalized_q for sequence in malicious_sequences):
+        logger.warning(f"[SECURITY ALERT] Prompt injection signature intercepted: '{query}'")
+        return False
+        
+    return True
 
 
 # ==========================================
@@ -210,11 +232,6 @@ async def start_session(
     global active_session, message_log, _last_activity_ts
     final_session_id = face_id or session_id or str(uuid.uuid4())
 
-    # ── Idempotent guard ────────────────────────────────────────────────────
-    # If this exact person/session is already active, do NOT reset
-    # message_log or rebroadcast session_start. Without this, a detection
-    # loop calling /session/start repeatedly for the same face wipes the
-    # chat and re-triggers the greeting every time it re-confirms presence.
     if active_session and active_session.get("session_id") == final_session_id:
         _last_activity_ts = datetime.now().timestamp()
         return {
@@ -236,7 +253,9 @@ async def start_session(
     _last_activity_ts = datetime.now().timestamp()
 
     db_face_id = face_id.strip() if face_id and face_id.strip() else None
-    save_session(final_session_id, db_face_id, user_name, is_returning, visit_count)
+    
+    # Executed asynchronously matching your new async MongoDB driver configuration
+    await save_session(final_session_id, db_face_id, user_name, is_returning, visit_count)
     await manager.broadcast({"type": "session_start", "session": active_session})
     return {"status": "success", "session_id": final_session_id, "session": active_session}
 
@@ -245,8 +264,7 @@ async def start_session(
 async def end_session_endpoint(session_id: str = None):
     global active_session, _last_activity_ts
     sid = session_id or (active_session["session_id"] if active_session else None)
-    if sid:
-        end_session(sid)
+    
     active_session    = None
     _last_activity_ts = 0.0
     await manager.broadcast({"type": "session_end", "session_id": sid})
@@ -289,115 +307,16 @@ async def post_message(payload: MessagePayload):
 
 
 # ==========================================
-# AUDIO PIPELINE ENDPOINTS (STT / TTS)
-# ==========================================
-
-@app.websocket("/ws/stt")
-async def stt_websocket_endpoint(ws: WebSocket):
-    await ws.accept()
-    print("[WS/STT] Browser connected")
-
-    loop = asyncio.get_event_loop()
-    partial_queue = asyncio.Queue()
-    final_queue   = asyncio.Queue()
-
-    def on_partial(text: str):
-        asyncio.run_coroutine_threadsafe(partial_queue.put(text), loop)
-
-    def on_final(text: str):
-        asyncio.run_coroutine_threadsafe(final_queue.put(text), loop)
-
-    pipeline = STTPipeline(on_partial=on_partial, on_final=on_final)
-    pipeline.start()
-
-    for _ in range(150):
-        if pipeline.is_ready():
-            break
-        await asyncio.sleep(0.1)
-
-    if not pipeline.is_ready():
-        await ws.send_json({"type": "error", "message": "STT failed to initialize"})
-        await ws.close()
-        return
-
-    await ws.send_json({"type": "ready"})
-
-    async def send_partials():
-        while True:
-            text = await partial_queue.get()
-            try:
-                await ws.send_json({"type": "partial", "text": text})
-            except:
-                break
-
-    async def send_finals():
-        while True:
-            text = await final_queue.get()
-            try:
-                await ws.send_json({"type": "final", "text": text})
-            except:
-                break
-
-    partial_task = asyncio.create_task(send_partials())
-    final_task   = asyncio.create_task(send_finals())
-
-    try:
-        while True:
-            message = await ws.receive()
-            if message["type"] == "websocket.disconnect":
-                break
-            if "bytes" in message and message["bytes"]:
-                pipeline.feed(message["bytes"])
-            elif "text" in message and message["text"] == "stop":
-                break
-    except WebSocketDisconnect:
-        pass
-    except Exception as e:
-        print(f"[WS/STT] Error: {e}")
-    finally:
-        partial_task.cancel()
-        final_task.cancel()
-        pipeline.stop()
-        print("[WS/STT] Connection closed")
-
-
-@app.post("/stt")
-async def speech_to_text(request: Request):
-    try:
-        audio_bytes = await request.body()
-        if not audio_bytes or len(audio_bytes) < 1000:
-            return {"text": "", "confidence": 0.0, "error": "No audio received"}
-        result = transcribe_audio(audio_bytes)
-        return result
-    except Exception as e:
-        logger.error(f"[STT] Endpoint error: {e}")
-        return {"text": "", "confidence": 0.0, "error": str(e)}
-
-
-@app.post("/tts")
-async def text_to_speech_endpoint(request: Request):
-    try:
-        body = await request.json()
-        text = body.get("text", "").strip()
-        if not text:
-            return {"error": "No text provided"}
-        audio_bytes = text_to_speech(text)
-        if not audio_bytes:
-            return {"fallback": True, "text": text}
-        audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
-        return {"audio": audio_b64, "fallback": False}
-    except Exception as e:
-        logger.error(f"[TTS] Endpoint error: {e}")
-        return {"fallback": True, "text": ""}
-
-
-# ==========================================
 # CORE WORKFLOW ROUTING ENGINE (ASK)
 # ==========================================
 @app.get("/ask")
 async def ask_kiosk(question: str = Query(..., description="Visitor question")):
     global _last_activity_ts, active_session
     _last_activity_ts = datetime.now().timestamp()
+
+    # Apply the backend security guardrail validation immediately
+    if not verify_input_safety(question):
+        raise HTTPException(status_code=400, detail="Security Exception: Request contains blocked sequences.")
 
     q_clean = question.lower().strip()
     q_clean = q_clean.translate(str.maketrans('', '', string.punctuation)).strip()
@@ -414,7 +333,7 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
 
     async def _respond(answer: str, source: str = "") -> dict:
         try:
-            save_interaction(sid, question, answer)
+            await save_interaction(sid, question, answer)
         except Exception as exc:
             logger.error("[DATABASE ERROR] Failed to log interaction: %s", exc)
         kiosk_entry = _log_message(answer, "kiosk")
@@ -435,8 +354,6 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
             f"You're welcome{', ' + visitor_name if visitor_name != 'there' else ''}! "
             "Have a great day. Goodbye!"
         )
-        if active_session:
-            end_session(active_session["session_id"])
         active_session    = None
         _last_activity_ts = 0.0
         await manager.broadcast({
@@ -446,53 +363,15 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
         })
         return await _respond(farewell)
 
-    # ─── Fees ─────────────────────────────────────────────────────────────────
-    if any(kw in q_normalized for kw in ["fee", "cost", "price", "instalment", "payment"]):
-        branch_keyword = next(
-            (b for b in ["cse", "ai", "data", "cyber", "ece", "vlsi", "eee", "mech", "civil"] if b in q_normalized),
-            None,
-        )
-        if branch_keyword:
-            fee_data = get_admission_fee_by_branch(branch_keyword)
-            if fee_data:
-                name, annual, inst1, inst2 = fee_data
-                if inst2 == 0:
-                    answer = (
-                        f"The annual management quota fee for {name} is ₹{annual:,.2f}. "
-                        "It must be paid as a single installment at the time of admission."
-                    )
-                else:
-                    answer = (
-                        f"The annual management fee for {name} is ₹{annual:,.2f}. "
-                        f"Split into ₹{inst1:,.2f} at admission and ₹{inst2:,.2f} via post-dated cheques over 3 months."
-                    )
-            else:
-                answer = "I couldn't find the exact fee for that stream. Management fees range from ₹1,10,000 to ₹7,50,000/year. Which branch are you asking about?"
-        else:
-            answer = "Management fees range from ₹1,10,000 (Civil) to ₹7,50,000/year (Core CSE). Name a specific branch for exact figures!"
-        return await _respond(answer)
+    # ─── Dynamic Cloud MongoDB Lookup ─────────────────────────────────────────
+    # Pull fresh structured details straight from MongoDB Compass/Atlas instead of local SQL scripts
+    kiosk_cloud_data = await get_kiosk_data()
+    if kiosk_cloud_data and "faqs" in kiosk_cloud_data:
+        for faq in kiosk_cloud_data["faqs"]:
+            if faq["question"].lower() in q_normalized:
+                return await _respond(faq["answer"], source="mongodb_atlas")
 
-    # ─── Documents ────────────────────────────────────────────────────────────
-    if any(kw in q_normalized for kw in ["document", "documents", "certificate", "paperwork", "bring", "marks card"]):
-        quota = "KCET" if any(k in q_normalized for k in ["cet", "kea", "govt"]) else "Management"
-        docs  = get_admission_requirements(quota)
-        if docs:
-            doc_list = "\n".join(f"- {doc}" for doc in docs)
-            answer   = f"For {quota} Quota admissions, bring originals and photocopies of:\n{doc_list}"
-        else:
-            answer = "Please bring your 10th and 12th Marks Cards, Transfer Certificate, Entrance Exam Rank Card, and ID copies to the Admin Block."
-        return await _respond(answer)
-
-    # ─── Greetings ────────────────────────────────────────────────────────────
-    short_greetings = {
-        "hi":  f"Hi {visitor_name}! Welcome to RNSIT. How can I help you today?",
-        "hey": f"Hey {visitor_name}! Welcome to RNS Institute of Technology. What can I help with?",
-        "ok":  "Alright! Let me know if you need any further assistance.",
-    }
-    if q_normalized in short_greetings:
-        return await _respond(short_greetings[q_normalized])
-
-    # ─── Redis cache ──────────────────────────────────────────────────────────
+    # ─── Redis cache fallback ──────────────────────────────────────────────────
     cache_key = f"kiosk:cache:{hashlib.md5(q_normalized.encode()).hexdigest()}"
     if redis_client:
         try:
@@ -503,7 +382,7 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
         except Exception as e:
             logger.warning("Redis read error: %s", e)
 
-    # ─── RAG Fallback ─────────────────────────────────────────────────────────
+    # ─── RAG Intelligent GenAI Fallback ─────────────────────────────────────────
     logger.info("[CACHE MISS] Running RAG for processed string: '%s'", q_normalized)
     try:
         answer = await generate_rag_kiosk_response(q_normalized, history=message_log[:-1][-6:])
@@ -520,123 +399,6 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
 
 
 # ==========================================
-# VISITOR MANAGEMENT ENDPOINTS
-# ==========================================
-@app.post("/visitor/unknown")
-async def visitor_unknown():
-    global visitor_name_response, active_session
-    if not visitor_name_response.get("ready"):
-        visitor_name_response = {"ready": False, "name": "", "save": True}
-
-    if active_session is None:
-        active_session = {
-            "session_id":   str(uuid.uuid4()),
-            "user_name":    "Unknown",
-            "is_returning": False,
-            "visit_count":  1,
-            "face_id":      "",
-            "trigger":      "camera",
-            "asking_name":  True,
-        }
-    else:
-        active_session["asking_name"] = True
-
-    await manager.broadcast({"type": "asking_name"})
-    return {"status": "asking"}
-
-
-@app.post("/visitor/greet")
-async def visitor_greet(request: Request):
-    """Play TTS greeting when a new face is detected."""
-    try:
-        body = await request.json()
-        text = body.get("text", "Hello! Welcome to RNSIT Kiosk.")
-        audio_bytes = text_to_speech(text)
-        audio_b64   = base64.b64encode(audio_bytes).decode("utf-8") if audio_bytes else None
-        await manager.broadcast({
-            "type":  "speak",
-            "text":  text,
-            "audio": audio_b64,
-        })
-        return {"status": "ok"}
-    except Exception as e:
-        logger.error(f"[GREET] Error: {e}")
-        return {"status": "error", "detail": str(e)}
-
-
-@app.post("/visitor/submit_name")
-async def submit_name(name: str = "Guest", save: bool = True):
-    global visitor_name_response, active_session
-    visitor_name_response = {"ready": True, "name": name, "save": save}
-    if active_session:
-        active_session["asking_name"] = False
-        active_session["user_name"]   = name
-    logger.info(f"[VISITOR] Name submitted: '{name}' save={save}")
-    return {"status": "ok"}
-
-
-@app.get("/visitor/name_response")
-def get_name_response():
-    return visitor_name_response
-
-
-@app.post("/visitor/clear_response")
-def clear_response():
-    global visitor_name_response
-    visitor_name_response = {"ready": False, "name": "", "save": True}
-    return {"status": "cleared"}
-
-
-@app.post("/visitor/delete_my_data")
-async def delete_my_data(name: str):
-    """
-    Delete face data for a visitor by name.
-    Also broadcasts cache_reload so detection.py picks up fresh DB on next recognition.
-    """
-    try:
-        face_ids = delete_face_by_name(name)
-        if not face_ids:
-            return {"success": False, "message": f"No data found for '{name}'."}
-
-        deleted_dirs = []
-        for face_id in face_ids:
-            face_dir = PROJECT_ROOT / "faces" / face_id
-            if face_dir.exists():
-                shutil.rmtree(face_dir)
-                deleted_dirs.append(str(face_dir))
-                logger.info(f"[DELETE] Removed face dir: {face_dir}")
-            else:
-                logger.info(f"[DELETE] No face dir found for face_id={face_id} (DB-only record, still deleted)")
-
-        # Remove old LBPH model if it exists (legacy artifact)
-        model_path = PROJECT_ROOT / "face_model.yml"
-        if model_path.exists():
-            model_path.unlink()
-            logger.info("[DELETE] Removed legacy face_model.yml")
-
-        # Tell all connected clients (including detection.py if it has a WS)
-        # to reload the face cache — detection.py reloads via _load_known_faces()
-        # automatically before next recognition, so this is just for UI awareness
-        await manager.broadcast({
-            "type":     "cache_reload",
-            "deleted":  name,
-            "face_ids": face_ids,
-        })
-
-        logger.info(f"[DELETE] Deleted {len(face_ids)} face record(s) for '{name}'")
-        return {
-            "success":      True,
-            "message":      f"Data for '{name}' deleted successfully.",
-            "face_ids":     face_ids,
-            "dirs_removed": deleted_dirs,
-        }
-
-    except Exception as exc:
-        logger.error(f"[DELETE] Error deleting data for '{name}': {exc}")
-        return {"success": False, "message": str(exc)}
-
-
-# ==========================================
 # BIOMETRICS / FACE REGISTRATION ENDPOINTS
 # ==========================================
 class RegisterFacePayload(BaseModel):
@@ -649,43 +411,23 @@ class RegisterFacePayload(BaseModel):
     def _strip_name(cls, v: str) -> str:
         return v.strip()
 
-    @field_validator("encoding")
-    @classmethod
-    def _validate_encoding(cls, v: List[float]) -> List[float]:
-        if not v:
-            raise ValueError("encoding must be non-empty")
-        return v
-
 
 @app.get("/faces/all")
-def get_all_faces_endpoint():
-    from backend.database import get_all_face_encodings
-    faces = get_all_face_encodings()
-    logger.info(f"[FACE] /faces/all returning {len(faces)} faces")
+async def get_all_faces_endpoint():
+    faces = await get_all_face_encodings()
+    logger.info(f"[FACE] /faces/all returning {len(faces)} faces from MongoDB")
     return {"faces": faces}
 
 
 @app.post("/faces/register")
 async def register_face(payload: RegisterFacePayload):
-    from backend.database import save_face_encoding
-    save_face_encoding(payload.face_id, payload.name, payload.encoding)
-    logger.info(f"[FACE] Registered: {payload.name} ({payload.face_id})")
+    await save_face_encoding(payload.face_id, payload.name, payload.encoding)
+    logger.info(f"[FACE] Registered in MongoDB: {payload.name} ({payload.face_id})")
     return {"status": "ok", "face_id": payload.face_id}
 
 
 @app.post("/faces/visit")
-def record_face_visit(face_id: str):
-    update_face_seen(face_id)
-    logger.info(f"[FACE] Visit count incremented for face_id={face_id}")
+async def record_face_visit(face_id: str):
+    await update_face_seen(face_id)
+    logger.info(f"[FACE] Visit count updated for face_id={face_id}")
     return {"status": "ok"}
-
-
-# Backward compatibility aliases
-@app.get("/face/all")
-def get_all_faces_old():
-    return get_all_faces_endpoint()
-
-
-@app.post("/face/register")
-async def register_face_old(payload: RegisterFacePayload):
-    return await register_face(payload)

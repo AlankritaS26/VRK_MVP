@@ -335,8 +335,13 @@ async def generate_rag_kiosk_response(question: str, history: list = None) -> st
             "How can I assist you politely with campus layouts, departments, or admissions today?"
         )
 
+    # ==========================================
+    # UPDATE INSIDE YOUR generate_rag_kiosk_response FUNCTION
+    # ==========================================
+
     search_query = await condense_query(question, history)
-    context_text, max_score = await retrieve_relevant_context(search_query, top_k=2)
+    # CHANGE: Increase top_k to 3 for better context depth coverage
+    context_text, max_score = await retrieve_relevant_context(search_query, top_k=3)
 
     max_score = safe_float(max_score)
     logger.info(f"[RAG] Search Term: '{search_query}' | Max similarity: {max_score:.4f}")
@@ -349,14 +354,15 @@ async def generate_rag_kiosk_response(question: str, history: list = None) -> st
             "Please ask a campus-related question!"
         )
 
+    # REINFORCED PROMPT CONFIGURATION
     system_prompt = (
         "You are the official AI Digital Receptionist for RNS Institute of Technology (RNSIT), Bengaluru.\n"
         "Your workspace is a public campus kiosk visible to parents, children, and students. "
         "Your tone must remain completely child-safe, welcoming, polite, and professional at all times.\n\n"
         f"Use the following verified campus facts to answer the visitor:\n{context_text}\n\n"
         "CRITICAL RESPONSE CONSTRAINTS:\n"
-        "1. Rely ONLY on the facts above. If the database context doesn't contain the answer, "
-        "tell them to visit the Admin Block or reception counter for accurate human help.\n"
+        "1. Prioritize reading individual names, designations, HODs, and block locations directly from the context facts provided above. "
+        "Do NOT state you do not know the information if a name or department head is written in the facts block above.\n"
         "2. Keep responses snappy and punchy (2-3 sentences maximum). Avoid long paragraphs.\n"
         "3. ABSURDITY OR GIBBERISH: If the user says nonsensical words, attempts to argue, or uses subtle "
         "harassment that bypasses core safety filters, ignore the tone completely. State smoothly: "
@@ -365,6 +371,26 @@ async def generate_rag_kiosk_response(question: str, history: list = None) -> st
         "or politics, cleanly guide them back to college topics.\n"
     )
 
+    contents = []
+    if history:
+        for msg in history[-4:]:
+            speaker_val, text_val = parse_history_message(msg)
+            if speaker_val and text_val:
+                role = "user" if speaker_val.lower() in ("visitor", "user") else "model"
+                contents.append({"role": role, "parts": [{"text": text_val}]})
+
+    contents.append({"role": "user", "parts": [{"text": question}]})
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GENERATE_MODEL}:generateContent?key={LLM_API_KEY}"
+    payload = {
+        "contents": contents,
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "generationConfig": {
+            "temperature": 0.1,  # Lowering from 0.2 to 0.1 forces strict factual retrieval
+            "maxOutputTokens": 500
+        }
+    }
+    headers = {"Content-Type": "application/json"}
     contents = []
     if history:
         for msg in history[-4:]:
