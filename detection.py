@@ -26,9 +26,21 @@ FACES_DIR   = Path("faces");   FACES_DIR.mkdir(exist_ok=True)
 MODEL_PATH  = Path("face_model.yml")
 LABELS_PATH = Path("face_labels.json")
 
-face_cascade = cv2.CascadeClassifier(
-    cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-)
+cascade_path = Path(cv2.data.haarcascades) / 'haarcascade_frontalface_default.xml'
+if not cascade_path.is_file():
+    for candidate in (
+        Path('/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml'),
+        Path('/usr/share/opencv/haarcascades/haarcascade_frontalface_default.xml'),
+    ):
+        if candidate.is_file():
+            cascade_path = candidate
+            break
+
+face_cascade = cv2.CascadeClassifier(str(cascade_path))
+if face_cascade.empty():
+    raise FileNotFoundError(
+        f"Haar cascade not found at {cascade_path}. Install the project's requirements first."
+    )
 recognizer = cv2.face.LBPHFaceRecognizer_create()
 label_map: dict[int, dict] = {}
 
@@ -178,9 +190,13 @@ def run():
     save_labels(label_map)
     load_model(label_map)
 
-    cam = cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW)
+    camera_backend = cv2.CAP_DSHOW if sys.platform == 'win32' else cv2.CAP_ANY
+    cam = cv2.VideoCapture(CAM_INDEX, camera_backend)
     if not cam.isOpened():
-        print("[ERROR] Cannot open camera.")
+        print(
+            f"[ERROR] Cannot open camera index {CAM_INDEX}. "
+            "Connect a camera and set CAMERA_INDEX if it is not the default."
+        )
         sys.exit(1)
 
     cx_history      = collections.deque(maxlen=FRAME_WINDOW)
