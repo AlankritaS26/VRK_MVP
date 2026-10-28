@@ -26,21 +26,26 @@ FACES_DIR   = Path("faces");   FACES_DIR.mkdir(exist_ok=True)
 MODEL_PATH  = Path("face_model.yml")
 LABELS_PATH = Path("face_labels.json")
 
-cascade_path = Path(cv2.data.haarcascades) / 'haarcascade_frontalface_default.xml'
-if not cascade_path.is_file():
-    for candidate in (
-        Path('/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml'),
-        Path('/usr/share/opencv/haarcascades/haarcascade_frontalface_default.xml'),
-    ):
-        if candidate.is_file():
-            cascade_path = candidate
-            break
+haar_file = 'haarcascade_frontalface_default.xml'
+cascade_candidates = []
+cv2_data = getattr(cv2, 'data', None)
+if cv2_data is not None and getattr(cv2_data, 'haarcascades', None):
+    cascade_candidates.append(Path(cv2_data.haarcascades) / haar_file)
+cascade_candidates.extend((
+    Path(cv2.__file__).resolve().parent / 'data' / haar_file,
+    Path('/usr/share/opencv4/haarcascades') / haar_file,
+    Path('/usr/share/opencv/haarcascades') / haar_file,
+))
+cascade_path = next((path for path in cascade_candidates if path.is_file()), None)
+if cascade_path is None:
+    raise FileNotFoundError(
+        "Haar cascade not found. Run 'python -m pip install -r requirements.txt' "
+        "from the project folder."
+    )
 
 face_cascade = cv2.CascadeClassifier(str(cascade_path))
 if face_cascade.empty():
-    raise FileNotFoundError(
-        f"Haar cascade not found at {cascade_path}. Install the project's requirements first."
-    )
+    raise RuntimeError(f"Failed to load Haar cascade from {cascade_path}.")
 recognizer = cv2.face.LBPHFaceRecognizer_create()
 label_map: dict[int, dict] = {}
 
